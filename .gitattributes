@@ -1,0 +1,19 @@
+* text=auto
+.gitattributes text eol=lf
+.gitignore text eol=lf
+requirements.txt text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.npz binary
+*.png binary
+*.mp4 binary
+*.obj binary
+*.glb binary
+*.mtl text eol=lf
+*.urdf text eol=lf
+
+# Preserve upstream formatting without flagging vendor-only whitespace.
+vendor/panda-gym/README.md whitespace=-blank-at-eol
+vendor/panda-gym/panda_gym/assets/robots/panda_allegro/franka_panda/panda.urdf whitespace=-blank-at-eol,-space-before-tab

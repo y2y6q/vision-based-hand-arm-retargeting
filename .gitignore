@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments and packaging
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local development output
+outputs/
+notes/
+timings_*.json
+*.log
+
+# Raw recordings are private and intentionally excluded.
+*.mp4
+!media/hand-arm-retargeting-demo.mp4
+
+# Nested repository internals must never be vendored.
+**/.git/
