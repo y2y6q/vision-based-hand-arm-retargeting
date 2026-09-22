@@ -1,132 +1,132 @@
-# robosuite 主线运行说明
+# robosuite mainline run instructions
 
-所有命令都在 PowerShell 中执行。当前主线使用独立环境 `E:\hand_arm_retargeting\.venv-robosuite`，不要把旧 PyBullet / panda-gym 参考环境混入本流程。
-
-```powershell
+Run every command in PowerShell. The active mainline uses E:\hand_arm_retargeting\.venv-robosuite. ~~~powershell
 Set-Location "E:\hand_arm_retargeting"
 $PY = ".\.venv-robosuite\Scripts\python.exe"
 & $PY --version
-```
+~~~
 
-## 1. 环境与依赖
+## 1. Environment and dependencies
 
-检查当前主线依赖：
+Check the installed mainline packages:
 
-```powershell
+~~~powershell
 & $PY -c "import robosuite, mujoco, numpy, cv2, mediapipe, hid; print(robosuite.__version__, mujoco.__version__, numpy.__version__)"
-```
+~~~
 
-按锁定文件同步现有主线依赖：
+Synchronize the locked dependencies:
 
-```powershell
+~~~powershell
 & $PY -m pip install -r .\requirements-robosuite-wrist.lock
-```
+~~~
 
-主进程不直接安装 dex-retargeting，因为官方 `pin>=2.7` 原生依赖不能与当前 Windows robosuite 环境可靠地混装。Panda + Allegro 默认启动一个独立 Python sidecar；sidecar 使用项目内保存且已核验 SHA-256 的官方 `dex-retargeting==0.4.6` wheel，主进程只通过本地 JSON 管道发送 21×3 MANO 关键点并接收 16 个关节目标。
+The main robosuite process does not directly install dex-retargeting. Its native pin>=2.7 dependencies are not reliably co-installable with the current Windows MuJoCo environment. Panda + Allegro launches a separate Python sidecar that loads the checked official dex-retargeting 0.4.6 wheel, receives 21 x 3 MANO landmarks through newline-delimited JSON, and returns 16 named Allegro targets.
 
-默认 `runtime=auto` 会寻找当前基础 Conda 环境同级的 `dexretarget\python.exe`。若你的隔离 dex 环境在其他位置，先设置：
+With runtime=auto, the application looks for dexretarget\python.exe next to the base Conda environment. If your isolated dex environment is elsewhere, set it before startup:
 
-```powershell
-$env:DEX_RETARGETING_PYTHON = "D:\your-dex-env\python.exe"
-```
+~~~powershell
+$env:DEX_RETARGETING_PYTHON = "D:\your-dex-environment\python.exe"
+~~~
 
-sidecar 只在子进程设置当前 Conda OpenMP 冲突所需的 `KMP_DUPLICATE_LIB_OK=TRUE`；它不会修改 robosuite / MuJoCo 进程的环境。
+Only the sidecar sets KMP_DUPLICATE_LIB_OK=TRUE for the current Conda OpenMP DLL collision. The robosuite / MuJoCo process is not modified.
 
-## 2. SpaceMouse 诊断
+## 2. SpaceMouse diagnostic
 
-诊断会显示设备发现、六轴原始值、校准后值、零偏、死区/平滑后的值、最终 OSC 六维动作、按钮状态、频率和断开错误。启动中位校准需要手柄保持中位 8 帧；没有报告、过期或断开时输出精确零。
+The diagnostic reports device discovery, raw six-axis values, calibrated values, offset, deadzone and smoothing output, final OSC action, button states, frequency, and disconnect errors. Keep the device centered during the initial eight-frame neutral calibration. Missing, stale, or disconnected input produces an exact zero action.
 
-```powershell
+~~~powershell
 & $PY .\scripts\run_spacemouse_panda_wrist_teleop.py diagnostic
 & $PY .\scripts\run_spacemouse_panda_wrist_teleop.py diagnostic --duration 30
-```
+~~~
 
-先在 3DxWare 中关闭鼠标滚轮、系统点击、径向菜单和驱动界面动作。项目配置与恢复命令：
+In 3DxWare, disable mouse-wheel emulation, system clicks, radial menus, and driver UI actions. Inspect, install, or restore the project profile:
 
-```powershell
+~~~powershell
 & $PY .\scripts\manage_3dxware_profile.py inspect
 & .\scripts\install_3dxware_spacemouse_profile.ps1
-& .\scripts\restore_3dxware_spacemouse_profile.ps1 -Manifest <备份清单路径>
-```
+& .\scripts\restore_3dxware_spacemouse_profile.ps1 -Manifest <backup-manifest-path>
+~~~
 
-## 3. 三个交互入口
+## 3. Interactive entry points
 
-Panda + Allegro 的默认手指模式是官方 dex。两个手同时出现时，代码会按检测到的右手索引选择同一条世界关键点，不会错误使用第 0 条手部数据。`runtime=auto` 只会选择官方 native runtime 或官方 sidecar；不能使用时会明确退出，绝不会自动改用旧映射。旧摄像头映射只能显式使用 `--hand-control legacy-curl`。
+Panda + Allegro defaults to official dex hand control. When two hands are detected, the runtime selects landmarks for the detected right hand instead of assuming hand index zero. runtime=auto accepts only an official native dex runtime or the official sidecar. If neither works, startup fails explicitly and never falls back silently to a rule-based mapping.
 
-```powershell
+~~~powershell
 & $PY .\scripts\run_spacemouse_panda_wrist_teleop.py integrated
 & $PY .\scripts\run_spacemouse_panda_wrist_teleop.py integrated --hand-control legacy-curl
 & $PY .\scripts\run_spacemouse_panda_jaw_gripper_teleop.py
 & $PY .\scripts\run_spacemouse_jaco_three_finger_teleop.py
-```
+~~~
 
-默认窗口是同步三视图：肩后方主视图、腕部视图和侧视图。合成画面为原生 `1920×1080`，主画面 `1530×1080`，两个辅助画面各 `380×535`。SpaceMouse 六轴先按主相机实时外参的 `[屏幕右方, 观察深度, 世界上方]` 转为世界坐标 `OSC_POSE`；物理推拉方向仍需人工确认。
+The default simulation viewer is a synchronized three-view composite: shoulder-back main view, wrist view, and side view. It renders at native 1920 x 1080: a 1530 x 1080 main image and two 380 x 535 auxiliary images. SpaceMouse motion is transformed from the main camera basis (screen-right, viewing depth, world-up) to world-coordinate OSC_POSE commands. Confirm physical axis directions manually.
 
-Panda + Allegro 默认还会打开实时摄像头状态窗口；追加 `--no-camera-display` 可关闭它，`--headless` 不创建任何窗口。`R` 重置，`Q` 或 `Ctrl+C` 安全退出；在三视图和摄像头窗口中都可用，关闭任一窗口也会安全退出。本机 4 秒自动化摄像头 smoke 未取得有效帧，不能替代人工观察；用户已于 2026-09-17 人工确认真人画面和手部关键点显示正常。
+Panda + Allegro also opens a live camera status window by default. Use --no-camera-display to hide it or --headless to create no windows. R resets. Q and Ctrl+C quit safely. R and Q work in both the camera and three-view windows; closing either window also triggers safe shutdown.
 
-Panda + Allegro 左右键以按下边沿切换两种 Allegro 手势。Panda 平行夹爪的 HID 位 0/1 分别闭合/张开；Jaco 的 HID 位 0/1 要按住才连续闭合/张开，松开立即发送零速度，双按保持不动。HID 位和实体左右按钮的对应仍需诊断确认。添加 `--no-three-view` 才使用原生单视图。
+For Panda + Allegro, the two SpaceMouse buttons toggle Allegro gestures on rising edges. PandaGripper uses HID bit 0 to close and bit 1 to open. Jaco requires the corresponding button to remain held for continuous opening or closing; release stops motion immediately. Confirm physical button mapping with the diagnostic command.
 
-仅在 Panda + Allegro `integrated` 中，`B/b` 会把当前交互 Lift 方块单次放大到默认尺寸的 1.5 倍；`R/r` 会恢复默认方块尺寸并完成原有完整重置。该按键不改变 OSC、手指或其他三个入口。
+In Panda + Allegro integrated mode only, B enlarges the interactive Lift cube once to 1.5x its default size. R restores the default size. This key does not change OSC, dex, or any other entry point.
 
-Panda + Allegro 的激光从 `palm_laser_site` 出发，始终沿世界坐标 `-Z` 垂直向下；它只提供定位画面，不改物理、碰撞或动作。
+The Panda + Allegro laser starts at palm_laser_site and points vertically down in world -Z. It is visual only and never changes physics, collision, or actions.
 
-## 3.1 Shadow Hand 严格预检
+## 3.1 Shadow Hand audit
 
-Shadow Hand 是第四个严格隔离的入口，目前不是可运行的遥操作程序。它只能检查本地模型和 robosuite 工厂注册：
+Shadow Hand is a strictly isolated fourth entry point. It is not yet a runnable teleoperation program.
 
-```powershell
+~~~powershell
 & $PY .\scripts\run_spacemouse_panda_shadow_hand_teleop.py --audit
-```
+~~~
 
-该命令会写入审计并成功退出，不会打开 HID、摄像头、MuJoCo 或 viewer。去掉 `--audit` 的普通启动会明确拒绝，因为本机 robosuite 1.5.2 没有可用的原生 Shadow Hand 注册和项目专用映射；程序不会把 Allegro 替换成 Shadow Hand。
+The audit writes its report and exits without opening HID, camera, MuJoCo, or a viewer. A regular Shadow Hand startup refuses because robosuite 1.5.2 has no verified native Shadow Hand registration or project-specific mapping. It never runs Allegro instead.
 
-## 4. 自动化无界面检查
+## 4. Headless automated smoke checks
 
-以下命令使用合成零运动输入，因此验证仿真、动作组装、重置、清理和夹爪开合，不代表真实 SpaceMouse 或摄像头已验证。
+These commands use synthetic zero-motion input. They validate simulation startup, action composition, reset, shutdown, and gripper behavior. They do not validate a physical SpaceMouse, a live camera, or human hand motion.
 
-`--headless-smoke` 使用安全张手；`--dex-smoke` 保持官方 dex sidecar、摄像头工作线程和 Panda + Allegro 22 维动作布局，但不伪造真人摄像头关键点。
-
-```powershell
+~~~powershell
 & $PY .\scripts\run_spacemouse_panda_wrist_teleop.py integrated --headless --headless-smoke --duration 2
 & $PY .\scripts\run_spacemouse_panda_wrist_teleop.py integrated --headless --dex-smoke --duration 2
 & $PY .\scripts\run_spacemouse_panda_jaw_gripper_teleop.py --headless --headless-smoke --duration 2
 & $PY .\scripts\run_spacemouse_jaco_three_finger_teleop.py --headless --headless-smoke --duration 2
-```
+~~~
 
-## 5. 可见三视图烟雾测试
+--headless-smoke uses a safe-open hand. --dex-smoke keeps the official dex sidecar, camera worker thread, and 22-D Panda + Allegro action layout active without inventing camera landmarks.
 
-以下命令会显示合成窗口、执行有限时间、保存首帧截图并自动退出。Panda / Jaco 的合成输入会产生一次闭合和一次张开。
+## 5. Visible three-view smoke checks
 
-```powershell
+These commands display the composite viewer briefly, save an initial screenshot, and quit automatically. Panda and Jaco smokes synthesize one close and one open command.
+
+~~~powershell
 & $PY .\scripts\run_spacemouse_panda_wrist_teleop.py integrated --viewer-smoke --duration 2.6
 & $PY .\scripts\run_spacemouse_panda_jaw_gripper_teleop.py --viewer-smoke --duration 2.6
 & $PY .\scripts\run_spacemouse_jaco_three_finger_teleop.py --viewer-smoke --duration 2.6
-```
+~~~
 
-Panda + Allegro 的 `B/b` 方块放大只用于交互运行，不包含在上述合成 viewer smoke 中。
+The interactive Panda + Allegro B key is intentionally outside these synthetic viewer tests.
 
-## 6. 自动化回归和 Gate 2
+## 6. Automated regression and Gate 2
 
-```powershell
+~~~powershell
 & $PY -m pytest -q .\tests
 & $PY .\scripts\run_grasp_validation.py --gate 2
 & $PY .\scripts\run_grasp_validation.py --gate 2 --visualize
-```
+~~~
 
-最后一条只重播已锁定的 Gate 2 静态抓取；它不会启动 Gate 3、02、运动规划或新的手部流程。
+The last command only replays the locked Gate 2 static grasp. It does not start Gate 3, workstream 02, motion planning, or a new hand pipeline.
 
-## 7. 冻结基线检查
+## 7. Frozen-baseline hash check
 
-```powershell
+~~~powershell
 & $PY .\scripts\verify_frozen_baseline_hash.py
-```
+~~~
 
-该检查覆盖冻结的 PyBullet / panda-gym 文件。若报告差异，先查看输出哈希清单；不要用当前 robosuite 修改覆盖旧基线。
+This check covers the frozen reference files. If it reports a mismatch, inspect the output manifest first. Never overwrite the frozen baseline from current robosuite work.
 
-## 8. 输出和回退
+## 8. Output, manual checks, and rollback
 
-Panda + Allegro 日志写入 `outputs\spacemouse_wrist\<时间戳>_integrated`，夹爪日志写入 `outputs\gripper_teleop\<时间戳>_*`。每个 dex 运行会在 metadata 和 telemetry 中记录 runtime、wheel SHA-256、配置 SHA-256、human indices 和 16 关节名称。每个可见三视图运行会写入未二次压缩的 `tri_view_laser_initial.png`。本轮 dex 无界面 smoke 日志位于 `outputs\spacemouse_wrist\20260922T022107Z_integrated`。
+Panda + Allegro logs are written to outputs\spacemouse_wrist\<timestamp>_integrated. Panda and Jaco logs are written to outputs\gripper_teleop\<timestamp>_*. Each dex run records its runtime, wheel SHA-256, configuration SHA-256, human indices, and 16 joint names in metadata and telemetry. A visible three-view run writes an uncompressed tri_view_laser_initial.png. The outputs directory is local evidence and is excluded from Git.
 
-关闭激光：将 `configs\spacemouse_wrist.json` 中的 `laser.enabled` 设为 `false`。关闭三视图：将 `tri_view.enabled` 设为 `false` 或追加 `--no-three-view`。将 `dex_hand.runtime` 改为 `native` 可以禁止 sidecar 并要求当前解释器原生安装官方依赖；切回旧手指映射只能显式使用 `--hand-control legacy-curl`。
+Before accepting live operation, manually verify the live image and landmarks, right-hand dex motion, SpaceMouse direction and neutral behavior, button isolation, R/Q/Ctrl+C cleanup, and a sustained dex sidecar session.
 
-修改前文件副本位于 `outputs\weekly_grasp_ux\20260916T153432Z\prechange\source_backup`；清单位于同目录的 `source_manifest_sha256.json`。恢复这些文件即可回退本轮改动。
+To disable the laser, set laser.enabled to false in configs\spacemouse_wrist.json. To disable the composite, set tri_view.enabled to false or pass --no-three-view. Set dex_hand.runtime to native to forbid the sidecar and require official dex dependencies inside the active interpreter. To use the old rule-based mapping, explicitly pass --hand-control legacy-curl.
+
+Pre-change copies and their SHA-256 manifest are stored locally under outputs\weekly_grasp_ux\20260916T153432Z\prechange\. Restore those copies to revert this iteration.
