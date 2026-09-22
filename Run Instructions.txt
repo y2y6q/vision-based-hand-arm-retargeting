@@ -1,10 +1,22 @@
 # robosuite mainline run instructions
 
-Run every command in PowerShell. The active mainline uses E:\hand_arm_retargeting\.venv-robosuite. ~~~powershell
+Run every command in PowerShell. The active mainline uses E:\hand_arm_retargeting\.venv-robosuite.
+
+~~~powershell
 Set-Location "E:\hand_arm_retargeting"
 $PY = ".\.venv-robosuite\Scripts\python.exe"
 & $PY --version
 ~~~
+
+## Current environment, baseline, and validation status
+
+- Platform: Windows; main interpreter: E:\hand_arm_retargeting\.venv-robosuite\Scripts\python.exe
+- Verified versions: Python 3.10.20, robosuite 1.5.2, and MuJoCo 3.3.7.
+- Main engineering baseline: robosuite + MuJoCo + Panda + OSC_POSE. Panda + Allegro uses a 22-D action vector: [0:6] for the wrist and [6:22] for the 16-joint hand.
+- Frozen reference baseline: legacy PyBullet / panda-gym files are hash-audited and are outside mainline changes.
+- Verified progress: Panda + Allegro, PandaGripper, Jaco, synchronized three-view rendering, Gate 2 regression, and the isolated official dex-retargeting sidecar.
+- Manual validation still required: live SpaceMouse axes and neutral behavior, camera landmarks, right-hand dex motion, button isolation, and safe R/Q/Ctrl+C cleanup during a live session.
+
 
 ## 1. Environment and dependencies
 

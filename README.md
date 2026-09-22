@@ -4,6 +4,17 @@ This repository contains a Windows robosuite and MuJoCo mainline for vision-base
 
 > **Project affiliation:** This project is developed within the University of Virginia Human-Robot Interaction Laboratory (UVA HRI Lab).
 
+## Runtime environment and engineering baseline
+
+- Platform: Windows
+- Main interpreter: E:\hand_arm_retargeting\.venv-robosuite\Scripts\python.exe
+- Python: 3.10.20
+- Core simulation packages: robosuite 1.5.2 and MuJoCo 3.3.7
+- Main engineering baseline: robosuite + MuJoCo + Panda + OSC_POSE
+- Hand-control baseline: Panda + right Allegro, with a 22-D action vector ([0:6] wrist, [6:22] hand)
+- Frozen reference baseline: the legacy PyBullet / panda-gym implementation is hash-audited only and must not be changed by mainline work.
+
+
 ## Current status
 
 | Area | Status | Evidence |
