@@ -7,12 +7,9 @@ from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
 import cv2
-import gymnasium as gym
 import mediapipe as mp
 import numpy as np
 import pybullet as p
-
-import panda_gym
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -21,28 +18,27 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-from src.teleop.constrained_ik_controller import (
-    ConstrainedIKController,
-)
 from src.teleop.monocular_wrist_pose import (
     MonocularWristPoseEstimator,
     WristPoseEstimate,
 )
-from src.teleop.pose_filter import (
-    FilteredPose,
-    PoseFilter,
-)
+from src.teleop.pose_filter import FilteredPose
 from src.teleop.pose_mapper import (
     MappedPose,
     PoseMapper,
+)
+from src.teleop.teleop_factory import (
+    ENVIRONMENT_ID,
+    create_environment,
+    create_ik_controller,
+    create_pose_filter,
+    get_shared_configuration_snapshot,
 )
 
 
 # ============================================================
 # 配置
 # ============================================================
-
-ENVIRONMENT_ID = "PandaAllegroPickAndPlace-v0"
 
 INTRINSICS_PATH = (
     PROJECT_ROOT
@@ -65,36 +61,23 @@ MAXIMUM_REPROJECTION_ERROR = 10.0
 
 SIMULATION_STEPS_PER_CAMERA_FRAME = 4
 
-# 手指目标滤波。
-# 旧版映射本身延迟较低，这里只保留较轻滤波。
 HAND_SMOOTHING_ALPHA = 0.45
 
 ROTATION_TRACKING_DEFAULT = True
+
+# Camera +Z -> Robot +X
+CAMERA_Z_TO_ROBOT_X_SCALE_MULTIPLIER = 1.9
+
+# Camera +X -> Robot -Y
+CAMERA_X_TO_ROBOT_NEGATIVE_Y_SCALE_MULTIPLIER = 1.9
+
+# Camera +Y -> Robot -Z
+CAMERA_Y_TO_ROBOT_NEGATIVE_Z_SCALE_MULTIPLIER = 1.9
 
 
 # ============================================================
 # 通用函数
 # ============================================================
-
-def normalize_vector(
-    vector: np.ndarray,
-) -> np.ndarray:
-    vector = np.asarray(
-        vector,
-        dtype=np.float64,
-    )
-
-    norm = float(
-        np.linalg.norm(vector)
-    )
-
-    if norm < 1e-8:
-        return np.zeros_like(
-            vector
-        )
-
-    return vector / norm
-
 
 def landmark_to_array(
     landmark,
@@ -173,13 +156,17 @@ def draw_text(
 ) -> None:
     y_position = (
         26
-        + line_index * 24
+        + line_index
+        * 24
     )
 
     cv2.putText(
         frame,
         text,
-        (13, y_position),
+        (
+            13,
+            y_position,
+        ),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.53,
         color,
@@ -224,21 +211,18 @@ def step_simulation(
     simulation,
     step_count: int,
 ) -> None:
-    for _ in range(
-        step_count
-    ):
+    for _ in range(step_count):
         if hasattr(
             simulation,
             "step",
         ):
             simulation.step()
-
         else:
             p.stepSimulation()
 
 
 # ============================================================
-# 旧版 MediaPipe 手指弯曲估计
+# MediaPipe 手指弯曲估计
 # ============================================================
 
 def estimate_finger_curl(
@@ -253,6 +237,7 @@ def estimate_finger_curl(
         0.0 = 张开
         1.0 = 弯曲
     """
+
     mcp = landmark_to_array(
         landmarks[
             landmark_ids[0]
@@ -319,12 +304,15 @@ def estimate_finger_curl(
         )
     )
 
-    mcp_distance = float(
-        np.linalg.norm(
-            mcp
-            - wrist
+    mcp_distance = (
+        float(
+            np.linalg.norm(
+                mcp
+                - wrist
+            )
         )
-    ) + 1e-6
+        + 1e-6
+    )
 
     distance_ratio = (
         fingertip_distance
@@ -416,8 +404,6 @@ def estimate_all_finger_curls(
         ],
     )
 
-    # Allegro 只有三根普通手指。
-    # 第三根使用人手 ring 和 pinky 的组合。
     allegro_ring_curl = (
         0.70
         * ring_curl
@@ -488,9 +474,7 @@ def curls_to_allegro_target_angles(
         open_angles.copy()
     )
 
-    for finger_index in range(
-        3
-    ):
+    for finger_index in range(3):
         start_index = (
             finger_index
             * 4
@@ -551,14 +535,45 @@ def curls_to_allegro_target_angles(
 # ============================================================
 
 def main() -> None:
-    print("=" * 80)
-    print("Camera -> PandaAllegro full teleoperation")
-    print("=" * 80)
-    print("Environment:", ENVIRONMENT_ID)
-    print("Intrinsics:", INTRINSICS_PATH)
-    print("Mapping:", MAPPING_CONFIG_PATH)
-    print("Finger mapping: restored MediaPipe curl mapping")
-    print("Finger control: independent from Panda IK")
+    print(
+        "="
+        * 80
+    )
+
+    print(
+        "Camera -> PandaAllegro "
+        "full teleoperation"
+    )
+
+    print(
+        "="
+        * 80
+    )
+
+    print(
+        "Environment:",
+        ENVIRONMENT_ID,
+    )
+
+    print(
+        "Intrinsics:",
+        INTRINSICS_PATH,
+    )
+
+    print(
+        "Mapping:",
+        MAPPING_CONFIG_PATH,
+    )
+
+    print(
+        "Finger mapping: "
+        "MediaPipe curl mapping"
+    )
+
+    print(
+        "Finger control: "
+        "independent from Panda IK"
+    )
 
     if not INTRINSICS_PATH.exists():
         raise FileNotFoundError(
@@ -572,10 +587,13 @@ def main() -> None:
             f"{MAPPING_CONFIG_PATH}"
         )
 
-    environment = gym.make(
-        ENVIRONMENT_ID,
-        render_mode="human",
-        control_type="ee",
+    print(
+        "Shared controller configuration:",
+        get_shared_configuration_snapshot(),
+    )
+
+    environment = (
+        create_environment()
     )
 
     capture = None
@@ -595,24 +613,15 @@ def main() -> None:
             unwrapped_environment.sim
         )
 
-        for _ in range(
-            120
-        ):
+        for _ in range(120):
             step_simulation(
                 simulation,
                 1,
             )
 
         ik_controller = (
-            ConstrainedIKController(
-                robot=robot,
-                maximum_joint_step=0.15,
-                maximum_position_error=0.025,
-                maximum_orientation_error_degrees=12.0,
-                soft_limit_margin=0.05,
-                joint_damping=0.05,
-                maximum_iterations=120,
-                residual_threshold=1e-5,
+            create_ik_controller(
+                robot
             )
         )
 
@@ -638,27 +647,45 @@ def main() -> None:
             )
         )
 
-        pose_filter = PoseFilter(
-            position_min_cutoff=1.0,
-            position_beta=0.03,
-            position_derivative_cutoff=1.0,
-            rotation_min_cutoff=1.5,
-            rotation_beta=0.05,
-            rotation_derivative_cutoff=1.0,
-            maximum_linear_velocity=0.18,
-            maximum_linear_acceleration=0.70,
-            maximum_angular_velocity=1.10,
-            maximum_angular_acceleration=3.50,
-            workspace_half_extent=np.array(
-                [
-                    0.22,
-                    0.22,
-                    0.20,
-                ],
-                dtype=np.float64,
-            ),
-            minimum_z=0.08,
-            maximum_relative_rotation_degrees=100.0,
+        original_position_scale = (
+            mapper
+            .position_scale
+            .copy()
+        )
+
+        adjusted_position_scale = (
+            original_position_scale
+            .copy()
+        )
+
+        adjusted_position_scale[0] *= (
+            CAMERA_Z_TO_ROBOT_X_SCALE_MULTIPLIER
+        )
+
+        adjusted_position_scale[1] *= (
+            CAMERA_X_TO_ROBOT_NEGATIVE_Y_SCALE_MULTIPLIER
+        )
+
+        adjusted_position_scale[2] *= (
+            CAMERA_Y_TO_ROBOT_NEGATIVE_Z_SCALE_MULTIPLIER
+        )
+
+        mapper.set_position_scale(
+            adjusted_position_scale
+        )
+
+        print(
+            "Original position_scale:",
+            original_position_scale,
+        )
+
+        print(
+            "Applied position_scale:",
+            mapper.position_scale,
+        )
+
+        pose_filter = (
+            create_pose_filter()
         )
 
         capture = cv2.VideoCapture(
@@ -685,11 +712,13 @@ def main() -> None:
         )
 
         drawing_utils = (
-            mp.solutions.drawing_utils
+            mp.solutions
+            .drawing_utils
         )
 
         drawing_styles = (
-            mp.solutions.drawing_styles
+            mp.solutions
+            .drawing_styles
         )
 
         calibration_active = True
@@ -729,23 +758,26 @@ def main() -> None:
             min_tracking_confidence=0.60,
         ) as hands:
             while True:
-                frame_success, frame = (
-                    capture.read()
-                )
+                (
+                    frame_success,
+                    frame,
+                ) = capture.read()
 
                 if not frame_success:
                     print(
                         "Cannot read webcam frame."
                     )
+
                     break
 
                 current_timestamp = (
                     time.monotonic()
                 )
 
-                frame_height, frame_width = (
-                    frame.shape[:2]
-                )
+                (
+                    frame_height,
+                    frame_width,
+                ) = frame.shape[:2]
 
                 rgb_frame = cv2.cvtColor(
                     frame,
@@ -778,12 +810,14 @@ def main() -> None:
                 if results.multi_hand_landmarks:
                     drawing_utils.draw_landmarks(
                         display_frame,
-                        results.multi_hand_landmarks[
-                            0
-                        ],
-                        mp_hands.HAND_CONNECTIONS,
-                        drawing_styles.get_default_hand_landmarks_style(),
-                        drawing_styles.get_default_hand_connections_style(),
+                        results
+                        .multi_hand_landmarks[0],
+                        mp_hands
+                        .HAND_CONNECTIONS,
+                        drawing_styles
+                        .get_default_hand_landmarks_style(),
+                        drawing_styles
+                        .get_default_hand_connections_style(),
                     )
 
                 estimate: Optional[
@@ -800,14 +834,15 @@ def main() -> None:
 
                 ik_result = None
 
-                # ====================================================
-                # Wrist pose calibration and estimation
-                # ====================================================
+                # ================================================
+                # 摄像头标定与手腕位姿估计
+                # ================================================
 
                 if normalized_landmarks is not None:
                     if calibration_active:
                         calibration_completed = (
-                            estimator.add_calibration_frame(
+                            estimator
+                            .add_calibration_frame(
                                 normalized_landmarks=(
                                     normalized_landmarks
                                 ),
@@ -848,9 +883,9 @@ def main() -> None:
                             )
                         )
 
-                # ====================================================
-                # Set Camera -> Robot reference
-                # ====================================================
+                # ================================================
+                # 设置 Camera -> Robot 参考
+                # ================================================
 
                 if (
                     estimate is not None
@@ -896,7 +931,8 @@ def main() -> None:
                             mapped_reference.position
                         ),
                         rotation=(
-                            mapped_reference.rotation_matrix
+                            mapped_reference
+                            .rotation_matrix
                         ),
                         timestamp=(
                             current_timestamp
@@ -915,12 +951,11 @@ def main() -> None:
                         dtype=np.float64,
                     )
 
-                    reference_pending = (
-                        False
-                    )
+                    reference_pending = False
 
                     print(
-                        "Robot teleoperation reference set."
+                        "Robot teleoperation "
+                        "reference set."
                     )
 
                     print(
@@ -939,9 +974,9 @@ def main() -> None:
                         ),
                     )
 
-                # ====================================================
-                # Wrist mapping and filtering
-                # ====================================================
+                # ================================================
+                # 手腕位置映射与滤波
+                # ================================================
 
                 tracking_valid = (
                     estimate is not None
@@ -966,12 +1001,13 @@ def main() -> None:
                     if mapped_pose.valid:
                         if rotation_tracking:
                             target_rotation = (
-                                mapped_pose.rotation_matrix
+                                mapped_pose
+                                .rotation_matrix
                             )
-
                         else:
                             target_rotation = (
-                                pose_filter.previous_rotation
+                                pose_filter
+                                .previous_rotation
                             )
 
                         filtered_pose = (
@@ -993,10 +1029,12 @@ def main() -> None:
                     filtered_pose = (
                         pose_filter.filter_pose(
                             target_position=(
-                                pose_filter.previous_position
+                                pose_filter
+                                .previous_position
                             ),
                             target_rotation=(
-                                pose_filter.previous_rotation
+                                pose_filter
+                                .previous_rotation
                             ),
                             timestamp=(
                                 current_timestamp
@@ -1005,16 +1043,12 @@ def main() -> None:
                         )
                     )
 
-                # ====================================================
-                # Allegro finger mapping
-                #
-                # 独立于 Panda IK。
-                # 即使 IK 被拒绝，手指仍然继续更新。
-                # ====================================================
+                # ================================================
+                # Allegro 手指映射
+                # ================================================
 
                 if (
-                    normalized_landmarks
-                    is not None
+                    normalized_landmarks is not None
                     and not teleoperation_paused
                 ):
                     raw_finger_curls = (
@@ -1041,12 +1075,13 @@ def main() -> None:
                     )
 
                     last_finger_curls = (
-                        raw_finger_curls.copy()
+                        raw_finger_curls
+                        .copy()
                     )
 
-                # ====================================================
+                # ================================================
                 # Panda IK
-                # ====================================================
+                # ================================================
 
                 if (
                     filtered_pose is not None
@@ -1073,19 +1108,12 @@ def main() -> None:
                         )
 
                         accepted_count += 1
-
                     else:
                         rejected_count += 1
 
-                # ====================================================
-                # Send robot command
-                #
-                # IK valid:
-                #     newest arm + newest hand
-                #
-                # IK invalid:
-                #     previous arm + newest hand
-                # ====================================================
+                # ================================================
+                # 下发机械臂与手指目标
+                # ================================================
 
                 if not teleoperation_paused:
                     all_joint_targets = (
@@ -1108,13 +1136,17 @@ def main() -> None:
                     SIMULATION_STEPS_PER_CAMERA_FRAME,
                 )
 
-                # ====================================================
-                # Camera overlay
-                # ====================================================
+                # ================================================
+                # 摄像头显示
+                # ================================================
 
                 if calibration_active:
-                    current_count, total_count = (
-                        estimator.calibration_progress
+                    (
+                        current_count,
+                        total_count,
+                    ) = (
+                        estimator
+                        .calibration_progress
                     )
 
                     draw_text(
@@ -1125,7 +1157,11 @@ def main() -> None:
                             f"{total_count}"
                         ),
                         0,
-                        (0, 255, 255),
+                        (
+                            0,
+                            255,
+                            255,
+                        ),
                     )
 
                     draw_text(
@@ -1135,7 +1171,11 @@ def main() -> None:
                             "and wrist still"
                         ),
                         1,
-                        (0, 255, 255),
+                        (
+                            0,
+                            255,
+                            255,
+                        ),
                     )
 
                 elif reference_pending:
@@ -1146,7 +1186,11 @@ def main() -> None:
                             "robot reference"
                         ),
                         0,
-                        (0, 255, 255),
+                        (
+                            0,
+                            255,
+                            255,
+                        ),
                     )
 
                 else:
@@ -1218,14 +1262,18 @@ def main() -> None:
                             display_frame,
                             (
                                 "target XYZ: "
-                                f"["
+                                "["
                                 f"{filtered_pose.position[0]:.3f}, "
                                 f"{filtered_pose.position[1]:.3f}, "
                                 f"{filtered_pose.position[2]:.3f}"
-                                f"]"
+                                "]"
                             ),
                             2,
-                            (255, 255, 0),
+                            (
+                                255,
+                                255,
+                                0,
+                            ),
                         )
 
                     if estimate is not None:
@@ -1281,7 +1329,11 @@ def main() -> None:
                                 f"{ik_result.position_error:.4f}"
                             ),
                             5,
-                            (255, 255, 255),
+                            (
+                                255,
+                                255,
+                                255,
+                            ),
                         )
 
                         draw_text(
@@ -1291,7 +1343,11 @@ def main() -> None:
                                 f"{ik_result.orientation_error_degrees:.2f} deg"
                             ),
                             6,
-                            (255, 255, 255),
+                            (
+                                255,
+                                255,
+                                255,
+                            ),
                         )
 
                         draw_text(
@@ -1301,7 +1357,11 @@ def main() -> None:
                                 f"{ik_result.maximum_joint_step:.4f}"
                             ),
                             7,
-                            (255, 255, 255),
+                            (
+                                255,
+                                255,
+                                255,
+                            ),
                         )
 
                     draw_text(
@@ -1314,7 +1374,11 @@ def main() -> None:
                             f"{last_finger_curls[3]:.2f}"
                         ),
                         8,
-                        (255, 255, 0),
+                        (
+                            255,
+                            255,
+                            0,
+                        ),
                     )
 
                     draw_text(
@@ -1325,19 +1389,28 @@ def main() -> None:
                             f"{rejected_count}"
                         ),
                         9,
-                        (255, 255, 255),
+                        (
+                            255,
+                            255,
+                            255,
+                        ),
                     )
 
                 draw_text(
                     display_frame,
                     (
                         "C: recalibrate | "
-                        "R: reset reference | "
+                        "R: full reset | "
                         "T: rotation | "
-                        "SPACE: pause | Q: quit"
+                        "SPACE: pause | "
+                        "Q: quit"
                     ),
                     18,
-                    (255, 255, 255),
+                    (
+                        255,
+                        255,
+                        255,
+                    ),
                 )
 
                 cv2.imshow(
@@ -1397,12 +1470,52 @@ def main() -> None:
                         teleoperation_paused,
                     )
 
+                # ================================================
+                # R：完整复位
+                # ================================================
+
                 if key in (
                     ord("r"),
                     ord("R"),
                 ):
+                    print(
+                        "Starting full reset..."
+                    )
+
+                    teleoperation_paused = True
+
+                    environment.reset()
+
+                    initial_joint_targets = np.asarray(
+                        robot.neutral_joint_values,
+                        dtype=np.float64,
+                    ).copy()
+
+                    robot.set_joint_angles(
+                        initial_joint_targets
+                    )
+
+                    robot.control_joints(
+                        target_angles=(
+                            initial_joint_targets
+                        )
+                    )
+
+                    for _ in range(120):
+                        step_simulation(
+                            simulation,
+                            1,
+                        )
+
+                    estimator.reset_calibration()
                     mapper.clear_reference()
                     pose_filter.reset()
+
+                    if hasattr(
+                        hands,
+                        "reset",
+                    ):
+                        hands.reset()
 
                     if hasattr(
                         ik_controller,
@@ -1410,19 +1523,55 @@ def main() -> None:
                     ):
                         ik_controller.reset_continuity_reference()
 
-                    last_arm_targets = np.asarray(
-                        ik_controller
-                        .get_current_arm_joint_angles(),
-                        dtype=np.float64,
+                    last_arm_targets = (
+                        initial_joint_targets[
+                            :7
+                        ].copy()
                     )
 
-                    reference_pending = (
-                        True
+                    filtered_hand_targets = (
+                        initial_joint_targets[
+                            7:23
+                        ].copy()
+                    )
+
+                    last_finger_curls = (
+                        np.zeros(
+                            4,
+                            dtype=np.float64,
+                        )
+                    )
+
+                    accepted_count = 0
+                    rejected_count = 0
+
+                    calibration_active = True
+                    reference_pending = True
+
+                    rotation_tracking = (
+                        ROTATION_TRACKING_DEFAULT
+                    )
+
+                    teleoperation_paused = False
+
+                    print(
+                        "Full reset completed."
                     )
 
                     print(
-                        "Robot reference reset."
+                        "Robot returned to "
+                        "initial configuration."
                     )
+
+                    print(
+                        "Keep palm open and "
+                        "wrist still for "
+                        "camera recalibration."
+                    )
+
+                # ================================================
+                # C：只重新标定
+                # ================================================
 
                 if key in (
                     ord("c"),
@@ -1444,13 +1593,8 @@ def main() -> None:
                         dtype=np.float64,
                     )
 
-                    calibration_active = (
-                        True
-                    )
-
-                    reference_pending = (
-                        True
-                    )
+                    calibration_active = True
+                    reference_pending = True
 
                     print(
                         "Full calibration restarted."

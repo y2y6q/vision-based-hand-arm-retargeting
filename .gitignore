@@ -1,14 +1,14 @@
-# Python
+# Python caches and test artifacts
 __pycache__/
 *.py[cod]
-*.pyd
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
 htmlcov/
 
-# Environments and packaging
+# Local environments and package outputs
+.venv-robosuite/
 .venv/
 venv/
 env/
@@ -16,21 +16,14 @@ env/
 build/
 dist/
 
-# IDE and OS
+# Local tools and generated logs
 .idea/
 .vscode/
-.DS_Store
-Thumbs.db
-
-# Local development output
+tmp/
 outputs/
-notes/
-timings_*.json
+MUJOCO_LOG.TXT
 *.log
 
-# Raw recordings are private and intentionally excluded.
-*.mp4
-!media/hand-arm-retargeting-demo.mp4
-
-# Nested repository internals must never be vendored.
-**/.git/
+# Operating-system files
+.DS_Store
+Thumbs.db

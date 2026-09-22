@@ -610,6 +610,7 @@ class PoseFilter:
         workspace_half_extent: Optional[
             np.ndarray
         ] = None,
+
         minimum_z: Optional[float] = None,
         maximum_relative_rotation_degrees: float = 120.0,
     ) -> None:

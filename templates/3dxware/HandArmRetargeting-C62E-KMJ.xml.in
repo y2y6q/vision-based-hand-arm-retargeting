@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  3DxWare 10 user-profile template for SpaceMouse Wireless (256F:C62E).
+  Replace {{EXECUTABLE_NAME}} and {{PROFILE_ID}} with a target executable.
+  The Python generator validates names, creates a backup manifest, and is the
+  supported way to install this template.
+-->
+<AppCfg Default="false" CfgFormatVersion="1.3" ThisFileVersion="1.0">
+  <CfgProperties>
+    <ID>{{PROFILE_ID}}</ID>
+    <Name>Hand Arm Retargeting ({{EXECUTABLE_NAME}})</Name>
+    <InheritsFromID>ID_Default_KMJ_Cfg</InheritsFromID>
+  </CfgProperties>
+  <AppInfo>
+    <Signature>
+      <Name>Hand Arm Retargeting ({{EXECUTABLE_NAME}})</Name>
+      <ExecutableName>{{EXECUTABLE_NAME}}</ExecutableName>
+      <Transport>KMJ</Transport>
+    </Signature>
+  </AppInfo>
+  <Devices>
+    <Device>
+      <ID>ID_ProductID_C62E</ID>
+      <Name>SpaceMouse Wireless</Name>
+      <CurrentAxisBank>HandArmRetargeting</CurrentAxisBank>
+      <AxisBank Default="true">
+        <ID>HandArmRetargeting</ID>
+        <Name>Hand Arm Retargeting</Name>
+        <InheritsFromID />
+        <!-- Repeat an Axis block with Enabled=false for HIDMultiAxis_X, Y, Z, Rx, Ry, Rz. -->
+      </AxisBank>
+      <ButtonBank Default="true">
+        <ID>HandArmRetargeting</ID>
+        <Name>Hand Arm Retargeting</Name>
+        <InheritsFromID />
+        <!-- Map V3DK_MENU_1 and V3DK_MENU_2 to Driver_Disabled. -->
+      </ButtonBank>
+    </Device>
+  </Devices>
+</AppCfg>

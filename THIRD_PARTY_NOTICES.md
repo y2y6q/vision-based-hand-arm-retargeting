@@ -1,33 +1,35 @@
 # Third-Party Notices
 
-This repository contains third-party software and robot assets required by the customized Panda-Allegro simulation environment. The original copyright notices and license files are retained.
+This repository retains the license files and provenance notes that accompany
+the third-party software and robot assets used by the project.
 
 ## panda-gym
 
 - Source: <https://github.com/qgallouedec/panda-gym>
-- Included version base: 3.0.8
+- Included base: 3.0.8
 - License: MIT
-- License file: [`vendor/panda-gym/LICENSE`](vendor/panda-gym/LICENSE)
-- Local changes: Panda-Allegro environment registration, robot implementation, pick-and-place task, and required model assets.
+- Local path: [`third_party/panda-gym`](third_party/panda-gym)
+- License copy: [`third_party/panda-gym/LICENSE`](third_party/panda-gym/LICENSE)
 
-## dex-urdf
+The directory is the frozen legacy reference baseline. The robosuite mainline
+reads its Panda-Allegro URDF assets but does not modify the baseline code.
 
-- Source: <https://github.com/dexsuite/dex-urdf>
-- Referenced revision: `f5e7132f22108164577fea4c25ef99b5cc0e1900`
+## dex-retargeting
+
+- Source: <https://pypi.org/project/dex-retargeting/0.4.6/>
+- Version: 0.4.6
 - License: MIT
-- License copy: [`vendor/licenses/dex-urdf-LICENSE`](vendor/licenses/dex-urdf-LICENSE)
-- Citation metadata: [`vendor/licenses/dex-urdf-CITATION.cff`](vendor/licenses/dex-urdf-CITATION.cff)
+- Verified wheel and SHA-256: [`third_party/dex_retargeting_0_4_6/PROVENANCE.md`](third_party/dex_retargeting_0_4_6/PROVENANCE.md)
 
-The Allegro Hand model files used by the customized environment were derived from the dex-urdf asset set. Their model-specific license is retained at:
+The official wheel runs only inside the isolated dex sidecar. The robosuite /
+MuJoCo process does not import its native dependencies.
 
-[`vendor/panda-gym/panda_gym/assets/robots/panda_allegro/allegro_hand/LICENSE`](vendor/panda-gym/panda_gym/assets/robots/panda_allegro/allegro_hand/LICENSE)
+## Shadow Hand assets
 
-## Franka Panda model
-
-The Franka Panda model included with the customized environment is distributed under the Apache License 2.0. Its license is retained at:
-
-[`vendor/panda-gym/panda_gym/assets/robots/panda_allegro/franka_panda/LICENSE.txt`](vendor/panda-gym/panda_gym/assets/robots/panda_allegro/franka_panda/LICENSE.txt)
+The locally audited Shadow Hand assets retain their source license at
+[`assets/shadow_hand/LICENSE-MUJOCOMENAGERIE.txt`](assets/shadow_hand/LICENSE-MUJOCOMENAGERIE.txt).
 
 ## Project license
 
-A root license for the project-specific source code has not yet been selected. The third-party licenses above apply only to their respective components.
+A root license for project-specific source has not yet been selected. The
+third-party licenses above apply only to their respective components.

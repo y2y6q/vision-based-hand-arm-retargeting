@@ -1,0 +1,164 @@
+{
+  "raw_ranges": [
+    350.0,
+    350.0,
+    350.0,
+    350.0,
+    350.0,
+    350.0
+  ],
+  "axis_order": [
+    1,
+    0,
+    2,
+    3,
+    4,
+    5
+  ],
+  "axis_inversion": [
+    1,
+    1,
+    -1,
+    1,
+    1,
+    1
+  ],
+  "device_to_world": [
+    [
+      1.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "coordinate_frame": "world",
+  "translation_deadzone": 0.08,
+  "rotation_deadzone": 0.08,
+  "translation_release_deadzone": 0.06,
+  "rotation_release_deadzone": 0.06,
+  "zero_bias_calibration_frames": 8,
+  "neutral_lock_frames": 3,
+  "translation_scale_m": 0.003,
+  "rotation_scale_rad": 0.025,
+  "max_translation_delta_m": 0.004,
+  "max_rotation_delta_rad": 0.04,
+  "smoothing_alpha": 0.35,
+  "control_hz": 20.0,
+  "stale_timeout_s": 0.25,
+  "discovery_interval_s": 0.5,
+  "hand_gestures": {
+    "left_button_index": 0,
+    "right_button_index": 1,
+    "interpolation_duration_s": 0.2,
+    "thumb_index_pinch_curls": [
+      0.85,
+      0.0,
+      0.0,
+      0.85
+    ],
+    "four_finger_pinch_curls": [
+      0.85,
+      0.8,
+      0.8,
+      0.85
+    ],
+    "safe_open_curls": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "tri_view": {
+    "enabled": true,
+    "front_camera_name": "frontview",
+    "wrist_camera_name": "robot0_eye_in_hand",
+    "side_camera_name": "sideview",
+    "image_width": 1530,
+    "image_height": 1080,
+    "render_hz": 20.0,
+    "layout": "main_left",
+    "thumbnail_scale": 0.24836601307189543,
+    "window_name": "Robosuite synchronized tri-view",
+    "show_window": true,
+    "front_position_m": [
+      -1.55,
+      -1.1,
+      1.52
+    ],
+    "front_quat_wxyz": [
+      0.7239870608246975,
+      0.5149914938413807,
+      -0.2660206107280316,
+      -0.3739779829045074
+    ],
+    "front_fovy_deg": 45.0,
+    "side_position_m": [
+      -0.05651774593317116,
+      1.2761224129427358,
+      1.4879572214102434
+    ],
+    "side_quat_wxyz": [
+      0.009905065491771751,
+      0.006877963156909582,
+      0.5912228352893879,
+      0.806418094001364
+    ],
+    "side_fovy_deg": 45.0,
+    "wrist_fovy_deg": 75.0,
+    "gutter_px": 10,
+    "display_width": 1600,
+    "display_height": 900
+  },
+  "laser": {
+    "enabled": true,
+    "color_rgba": [
+      1.0,
+      0.05,
+      0.05,
+      0.9
+    ],
+    "width_m": 0.003,
+    "max_length_m": 1.2,
+    "start_site": "grip_site",
+    "visual_site": "grip_site_cylinder",
+    "local_direction": [
+      0.0,
+      0.0,
+      1.0
+    ],
+    "visible_views": [
+      "front",
+      "wrist",
+      "side"
+    ],
+    "hide_on_no_hit": false
+  },
+  "dex_hand": {
+    "stale_timeout_s": 0.5,
+    "expected_handedness": "Right",
+    "input_is_mirrored": false,
+    "runtime": "auto"
+  },
+  "grasp_telemetry": {
+    "lift_height_m": 0.03,
+    "hold_duration_s": 3.0,
+    "max_penetration_m": 0.004,
+    "cube_body_name": "cube_main",
+    "table_geom_name": "table_collision"
+  },
+  "neutral_startup_s": 0.3,
+  "vendor_id": null,
+  "product_id": null,
+  "output_dir": "outputs/spacemouse_wrist",
+  "control_frame": "camera"
+}
