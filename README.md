@@ -2,7 +2,6 @@
 
 本项目在 Windows 上使用 robosuite 和 MuJoCo 运行 Panda、Allegro、Panda 平行夹爪和 Jaco 三指夹爪。SpaceMouse 六轴只控制机械臂末端；手部、夹爪、摄像头和按钮不会改写机械臂六维动作。
 
-旧 PyBullet / panda-gym 目录是冻结参考基线，不是当前入口。
 
 ## 当前状态
 
