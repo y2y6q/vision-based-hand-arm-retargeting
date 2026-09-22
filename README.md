@@ -2,6 +2,8 @@
 
 This repository contains a Windows robosuite and MuJoCo mainline for vision-based teleoperation. The current system uses OSC_POSE to control a Panda wrist with a SpaceMouse. Camera hand input controls a dexterous hand or gripper without changing the arm command.
 
+> **Project affiliation:** This project is developed within the University of Virginia Human-Robot Interaction Laboratory (UVA HRI Lab).
+
 ## Current status
 
 | Area | Status | Evidence |
@@ -16,7 +18,7 @@ This repository contains a Windows robosuite and MuJoCo mainline for vision-base
 | Official dex-retargeting sidecar | Verified | The isolated worker loads dex-retargeting 0.4.6, creates SeqRetargeting, runs retarget/reset, and writes only bounded named Allegro targets. |
 | Live SpaceMouse direction, camera retargeting, and grasping | Manual verification required | Automated synthetic input cannot validate physical axes, camera quality, human motion, or live teleoperation. |
 
-## Latest progress+�u���T 2026-09-22
+## Latest progress - 2026-09-22
 
 Panda + Allegro now defaults to official dex hand control. The main robosuite process launches an isolated sidecar, avoiding direct native dex dependency imports in the MuJoCo process. The worker loads the bundled dex-retargeting 0.4.6 wheel, constructs the official Allegro vector solver, and returns named hand targets through newline-delimited JSON.
 
