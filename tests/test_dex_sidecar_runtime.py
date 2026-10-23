@@ -23,6 +23,7 @@ from wrist_teleop.dex_retargeting import (  # noqa: E402
     OFFICIAL_CONFIG_SHA256,
     OFFICIAL_DEX_VERSION,
     DexRetargetingAdapter,
+    mediapipe_world_to_mano,
 )
 from wrist_teleop.hand_input import DexHandInputAdapter  # noqa: E402
 
@@ -49,11 +50,28 @@ class DexSidecarRuntimeTests(unittest.TestCase):
         self.adapter.close()
 
     @staticmethod
-    def _world_landmarks() -> np.ndarray:
+    def _open_hand_world_landmarks() -> np.ndarray:
+        """A non-degenerate open right hand in MediaPipe world coordinates."""
+
         return np.asarray(
-            [[index * 0.004, index * 0.002, -index * 0.003] for index in range(21)],
+            (
+                (0.000, 0.000, 0.000), (0.020, -0.004, 0.005), (0.030, 0.006, 0.007),
+                (0.040, 0.016, 0.006), (0.050, 0.024, 0.004), (0.030, 0.000, 0.000),
+                (0.034, 0.026, 0.003), (0.036, 0.050, 0.005), (0.038, 0.070, 0.006),
+                (0.000, 0.050, 0.000), (0.000, 0.080, 0.002), (0.000, 0.105, 0.003),
+                (0.000, 0.125, 0.004), (-0.026, 0.040, 0.000), (-0.030, 0.066, 0.002),
+                (-0.032, 0.088, 0.003), (-0.034, 0.106, 0.004), (-0.044, 0.012, 0.000),
+                (-0.052, 0.032, 0.002), (-0.057, 0.049, 0.003), (-0.060, 0.064, 0.004),
+            ),
             dtype=np.float64,
         )
+
+    @classmethod
+    def _closed_hand_world_landmarks(cls) -> np.ndarray:
+        closed = cls._open_hand_world_landmarks().copy()
+        for start, mcp in ((1, 1), (5, 5), (9, 9), (13, 13), (17, 17)):
+            closed[start + 1 : start + 4] = closed[mcp] + 0.28 * (closed[start + 1 : start + 4] - closed[mcp])
+        return closed
 
     def test_official_solver_retargets_and_resets(self) -> None:
         metadata = self.adapter.metadata()
@@ -63,13 +81,14 @@ class DexSidecarRuntimeTests(unittest.TestCase):
         self.assertEqual(metadata["human_indices"], [[0, 0, 0, 0], [4, 8, 12, 16]])
         self.assertEqual(set(metadata["retargeting_joint_names"]), set(ALLEGRO_JOINT_NAMES))
 
-        result = self.adapter.retarget(self._world_landmarks())
+        mano = mediapipe_world_to_mano(self._open_hand_world_landmarks(), handedness="Right")
+        result = self.adapter.retarget(mano)
         self.assertEqual(result.joint_targets_rad.shape, (16,))
         self.assertTrue(np.all(np.isfinite(result.joint_targets_rad)))
         self.assertTrue(np.all(result.joint_targets_rad >= self.lower))
         self.assertTrue(np.all(result.joint_targets_rad <= self.upper))
         self.adapter.reset()
-        repeated = self.adapter.retarget(self._world_landmarks())
+        repeated = self.adapter.retarget(mano)
         self.assertTrue(np.all(np.isfinite(repeated.joint_targets_rad)))
 
     def test_dex_camera_path_writes_only_the_real_hand_slice(self) -> None:
@@ -80,7 +99,7 @@ class DexSidecarRuntimeTests(unittest.TestCase):
             joint_names=ALLEGRO_JOINT_NAMES,
         )
         command = camera_adapter.update_world_landmarks(
-            self._world_landmarks(), "Right", timestamp_s=10.0
+            self._open_hand_world_landmarks(), "Right", timestamp_s=10.0
         )
         self.assertTrue(command.valid, command.error)
 
@@ -96,6 +115,26 @@ class DexSidecarRuntimeTests(unittest.TestCase):
             env.step(action)
         finally:
             env.close()
+
+    def test_official_camera_path_changes_targets_for_open_and_closed_hand(self) -> None:
+        camera_adapter = DexHandInputAdapter(
+            self.adapter,
+            lower_limits=self.lower,
+            upper_limits=self.upper,
+            joint_names=ALLEGRO_JOINT_NAMES,
+        )
+        open_command = camera_adapter.update_world_landmarks(
+            self._open_hand_world_landmarks(), "Right", timestamp_s=10.0
+        )
+        self.assertTrue(open_command.valid, open_command.error)
+        camera_adapter.reset(timestamp_s=10.1)
+        closed_command = camera_adapter.update_world_landmarks(
+            self._closed_hand_world_landmarks(), "Right", timestamp_s=10.2
+        )
+        self.assertTrue(closed_command.valid, closed_command.error)
+        delta = np.asarray(closed_command.joint_targets) - np.asarray(open_command.joint_targets)
+        self.assertGreater(float(np.linalg.norm(delta)), 0.1)
+        self.assertGreater(int(np.count_nonzero(np.abs(delta) > 1e-4)), 4)
 
 
 if __name__ == "__main__":

@@ -29,9 +29,14 @@ from wrist_teleop.device import MotionSample, SpaceMouseHid  # noqa: E402
 from wrist_teleop.grasp_telemetry import GraspTelemetry  # noqa: E402
 from wrist_teleop.hand_input import CameraHandWorker  # noqa: E402
 from wrist_teleop.interactive_cube import InteractiveCubeScaler  # noqa: E402
+from wrist_teleop.recording import SimVideoRecorder  # noqa: E402
 from wrist_teleop.mapper import SixDofMapper  # noqa: E402
 from wrist_teleop.runtime_controls import KeyboardCommandRouter, install_viewer_key_callback  # noqa: E402
-from wrist_teleop.shadow_gripper import make_shadow_panda_env  # noqa: E402
+from wrist_teleop.shadow_gripper import (  # noqa: E402
+    SHADOW_PALMAR_NORMAL_LOCAL,
+    SHADOW_PALM_VIEW_CAMERA,
+    make_shadow_panda_env,
+)
 from wrist_teleop.shadow_hand import audit_shadow_hand_support  # noqa: E402
 from wrist_teleop.shadow_hand_input import ShadowHandGestureController, ShadowLegacyHandInput  # noqa: E402
 from wrist_teleop.shadow_integrated import PandaShadowActionComposer  # noqa: E402
@@ -39,6 +44,11 @@ from wrist_teleop.visualization import LaserPointer, TriViewCompositor  # noqa: 
 
 
 _CUBE_FACTOR = 1.5
+# The Shadow's 20 position actuators move from MuJoCo's neutral reset pose to
+# its safe-open pose.  Let that internal hand transient finish before the
+# viewer appears and then latch OSC at the settled Panda pose.  This is not a
+# pose override: every step still runs ordinary MuJoCo physics with gravity.
+_SHADOW_RESET_SETTLE_S = 0.75
 
 
 def _jsonable(value: Any) -> Any:
@@ -98,7 +108,28 @@ class _NeutralInput:
 
 
 def _laser_config(config: WristConfig):
-    return replace(config.laser, start_site="palm_laser_site", direction_frame="world", world_direction=(0.0, 0.0, -1.0))
+    """Use the Shadow palm normal for the visual targeting ray."""
+
+    return replace(
+        config.laser,
+        start_site="palm_laser_site",
+        direction_frame="site",
+        local_direction=SHADOW_PALMAR_NORMAL_LOCAL,
+        # The palm camera is co-linear with the ray. Hide the physical cylinder
+        # there so the target remains visible; the compositor paints its
+        # centreline reticle in that panel.
+        visible_views=("front", "side"),
+    )
+
+
+def _shadow_tri_view_config(config: WristConfig):
+    """Use the direct-mount Shadow palm aim camera instead of Panda's EEF eye."""
+
+    return replace(
+        config.tri_view,
+        wrist_camera_name=f"gripper0_right_{SHADOW_PALM_VIEW_CAMERA}",
+        wrist_fovy_deg=82.0,
+    )
 
 
 def _sleep(cycle_started: float, control_hz: float) -> None:
@@ -132,6 +163,15 @@ def _reset(
         seeded_buttons = (False,) * required
     hand = gestures.reset(buttons=seeded_buttons)
     action = composer.compose(np.zeros(6), hand.joint_targets)
+    # The direct Shadow mount is intentionally rigid. Its safe-open fingers
+    # can impart a short physical startup transient, so absorb it off-screen
+    # and only then latch the zero-OSC goal. This keeps subsequent neutral
+    # SpaceMouse input from inheriting a startup twitch.
+    settle_steps = max(1, int(round(_SHADOW_RESET_SETTLE_S * float(mapper.config.control_hz))))
+    for _ in range(settle_steps):
+        env.step(action)
+    composer.initialize_goal()
+    action = composer.compose(np.zeros(6), hand.joint_targets)
     env.step(action)
     return composer, gestures, hand, action
 
@@ -162,7 +202,8 @@ def _write_audit(config: WristConfig) -> Path:
 
 def run_shadow(
     config: WristConfig, *, headless: bool, duration_s: float | None, camera_index: int,
-    camera_display: bool, hand_control: str, synthetic_input: bool, three_view: bool,
+    camera_display: bool, camera_mirror: bool, hand_control: str, synthetic_input: bool, three_view: bool,
+    record_path: Path | None = None,
 ) -> int:
     """Run real Panda + Shadow physics; no Shadow dex path is selected here."""
     if hand_control not in {"legacy-curl", "off"}:
@@ -171,7 +212,9 @@ def run_shadow(
     mapper = SixDofMapper(config)
     device: Any = _NeutralInput() if synthetic_input else SpaceMouseHid(config)
     keyboard = KeyboardCommandRouter()
-    use_three_view = bool(three_view and config.tri_view.enabled)
+    tri_view_config = _shadow_tri_view_config(config)
+    use_three_view = bool(three_view and tri_view_config.enabled)
+    recorder = SimVideoRecorder(record_path, fps=config.control_hz)
     camera: Any = _NullCamera()
     env = composer = gestures = laser = tri_view = grasp = cube = None
     hand_input: ShadowLegacyHandInput | None = None
@@ -212,16 +255,19 @@ def run_shadow(
         assert env is not None
         next_laser = LaserPointer(env, _laser_config(config))
         next_tri = TriViewCompositor(
-            config.tri_view, show_window=True, key_handler=lambda key: route(key, "tri_view"),
+            tri_view_config, show_window=True, key_handler=lambda key: route(key, "tri_view"),
             on_close=lambda: keyboard.feed("q", source="tri_view_window"), laser=next_laser,
         )
         next_tri.configure_cameras(env)
-        nonlocal_control = mapper.set_camera_from_sim(env, config.tri_view.front_camera_name)
+        nonlocal_control = mapper.set_camera_from_sim(env, tri_view_config.front_camera_name)
         return next_laser, next_tri, {"laser": next_laser.update(), "control_frame": nonlocal_control}
 
     try:
         env = make_shadow_panda_env(config, has_renderer=not headless and not use_three_view,
-                                    has_offscreen_renderer=bool(use_three_view and not headless))
+                                    has_offscreen_renderer=bool(use_three_view or record_path is not None),
+                                    # OSC point on the flange mount, not behind
+                                    # Shadow's soft wrist joints (arm drift).
+                                    rigid_tcp=True)
         device_info = device.open()
         # Read limits from the actual loaded 20-actuator model, then let R reset
         # rebuild it once into the normal no-startup-jump OSC state.
@@ -230,6 +276,7 @@ def run_shadow(
         hand_input = ShadowLegacyHandInput(preview.hand_lower_limits, preview.hand_upper_limits)
         if hand_control == "legacy-curl":
             camera = CameraHandWorker(hand_input, camera_index=camera_index, display=camera_display,
+                                      mirror_input=camera_mirror,
                                       keypress_callback=lambda key: route(key, "camera"), status_provider=camera_status)
         composer, gestures, reset_hand, reset_action = _reset(
             env, mapper=mapper, device=device, hand_input=hand_input, gestures=None, buttons=last_buttons,
@@ -246,12 +293,14 @@ def run_shadow(
         log.metadata({
             "mode": "panda_shadow_integrated", "headless": headless, "synthetic_input": synthetic_input,
             "three_view": use_three_view, "camera_index": camera_index, "camera_display": camera_display,
+            "camera_mirror": camera_mirror,
             "config": config.to_dict(), "device": device_info, "shadow_hand": composer.describe(),
             "hand_mode": hand_control, "shadow_dex": {"integrated": False, "reason": "deferred by design"},
             "camera_hand_input": {"algorithm": "MediaPipe landmarks + Shadow legacy curl" if hand_control == "legacy-curl" else "safe-open/off", "actuator_count": 20},
             "button_gestures": {"config": config.hand_gestures.to_dict(), "targets": gestures.gesture_targets},
             "visualization": {"laser_config": _laser_config(config).__dict__, "initial": visual_initial},
             "control_frame": control_frame, "interactive_cube": cube.status(),
+            "recording": recorder.summary(),
         })
         print("Panda + Shadow Hand ready: 6 OSC wrist dimensions + 20 official Shadow actuator dimensions.")
         print("hand mode=legacy-curl" if hand_control == "legacy-curl" else "hand mode=off (safe-open)")
@@ -304,12 +353,20 @@ def run_shadow(
             set_hand_status(hand)
             action = composer.compose(wrist, hand.joint_targets)
             _obs, reward, done, _info = env.step(action)
+            recorder.capture(env)
             grasp_record = grasp.update() if grasp is not None else {"available": False}
             laser_record = laser.update() if laser is not None else {"enabled": False}
             tri_record = tri_view.update(
                 env, status_text=(f"Panda + Shadow | hand={hand.source} | wrist={np.linalg.norm(wrist):.4f} | "
                                   f"cube={'1.5x' if cube is not None and cube.enlarged else 'default'} | B=enlarge"),
             ) if tri_view is not None else {"enabled": False}
+            # Keep OpenCV's two windows on the same main thread. The camera
+            # worker acquires / annotates frames only; this loop owns HighGUI.
+            camera_display_record = (
+                camera.show_latest()
+                if camera_display and hasattr(camera, "show_latest")
+                else {"enabled": False, "reason": "headless_or_unavailable"}
+            )
             if tri_view is not None and screenshot is None and tri_record.get("rendered"):
                 screenshot = log.path / "tri_view_shadow_initial.png"
                 tri_view.save_last_frame(screenshot)
@@ -331,7 +388,9 @@ def run_shadow(
                 "camera": {"valid": camera_hand.valid, "tracking_state": camera_hand.tracking_state,
                            "curls": camera_hand.curls, "error": camera_hand.error or camera.error,
                            "worker_running": camera.running, "worker_status": camera.status() if hasattr(camera, "status") else None},
+                "camera_display": camera_display_record,
                 "visualization": {"laser": laser_record, "tri_view": tri_record}, "grasp": grasp_record,
+                "recording": recorder.summary() if recorder.frame_count == 1 else None,
                 "reward": reward, "done": done,
             })
             _sleep(cycle_started, config.control_hz)
@@ -346,6 +405,8 @@ def run_shadow(
         try:
             if grasp is not None:
                 log.event({"event": "grasp_summary", "timestamp_monotonic_s": time.monotonic(), "grasp": grasp.summary()})
+            recorder.close()
+            log.event({"event": "recording_summary", "timestamp_monotonic_s": time.monotonic(), "recording": recorder.summary()})
             if tri_view is not None:
                 tri_view.close()
             if laser is not None:
@@ -369,8 +430,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audit", action="store_true", help="write the local model/action audit and exit")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--duration", type=float, default=None)
+    parser.add_argument("--record", type=Path, default=None, help="optional front-view MP4 path; PNG frames are used if the codec is unavailable")
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--no-camera-display", action="store_true")
+    parser.add_argument("--camera-no-mirror", action="store_true", help="use only when the camera driver already mirrors its image")
     parser.add_argument("--hand-control", choices=("legacy-curl", "off"), default="legacy-curl")
     parser.add_argument("--no-three-view", action="store_true")
     parser.add_argument("--viewer-smoke", action="store_true")
@@ -404,9 +467,11 @@ def main() -> int:
         return 0 if audit.ready else 2
     return run_shadow(
         config, headless=args.headless, duration_s=args.duration, camera_index=args.camera_index,
-        camera_display=not args.headless and not args.no_camera_display, hand_control=args.hand_control,
+        camera_display=not args.headless and not args.no_camera_display, camera_mirror=not args.camera_no_mirror,
+        hand_control=args.hand_control,
         synthetic_input=args.viewer_smoke or args.headless_smoke,
         three_view=not args.headless and not args.no_three_view,
+        record_path=args.record,
     )
 
 

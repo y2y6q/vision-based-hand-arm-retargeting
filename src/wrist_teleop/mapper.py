@@ -112,6 +112,7 @@ class SixDofMapper:
         self._filtered = np.zeros(6, dtype=np.float64)
         self._axis_active = np.zeros(6, dtype=bool)
         self._neutral_frames = 0
+        self._dominant_group: str | None = None
         self._last_diagnostics: dict[str, Any] = {
             "valid": False,
             "calibrated_axes": [0.0] * 6,
@@ -202,6 +203,7 @@ class SixDofMapper:
         self._filtered.fill(0.0)
         self._axis_active.fill(False)
         self._neutral_frames = 0
+        self._dominant_group = None
         self._last_diagnostics = {
             "valid": False,
             "calibrated_axes": [0.0] * 6,
@@ -231,6 +233,41 @@ class SixDofMapper:
         # Clamp the magnitude before multiplying by the physical scale. This
         # also avoids overflow for extreme but finite raw input/config values.
         return vector * min(scale, maximum / norm)
+
+    def _decouple(self, mapped: np.ndarray) -> np.ndarray:
+        """Keep one motion group and drop weak off-axis components.
+
+        A SpaceMouse cap tilts whenever it is pushed and shifts whenever it
+        is tilted; logged sessions had both groups active in about 70% of
+        motion samples. Passing only the dominant group (with hysteresis so
+        it does not flicker) stops a push from also rotating the hand.
+        """
+        result = mapped.copy()
+        translation = float(np.linalg.norm(result[:3]))
+        rotation = float(np.linalg.norm(result[3:]))
+        if self.config.motion_coupling == "dominant":
+            ratio = self.config.dominant_switch_ratio
+            if translation == 0.0 and rotation == 0.0:
+                self._dominant_group = None
+            elif self._dominant_group is None:
+                self._dominant_group = "translation" if translation >= rotation else "rotation"
+            elif self._dominant_group == "translation" and rotation > ratio * translation:
+                self._dominant_group = "rotation"
+            elif self._dominant_group == "rotation" and translation > ratio * rotation:
+                self._dominant_group = "translation"
+            if self._dominant_group == "translation":
+                result[3:] = 0.0
+            elif self._dominant_group == "rotation":
+                result[:3] = 0.0
+        snap = self.config.axis_snap_ratio
+        if snap > 0.0:
+            for group in (slice(0, 3), slice(3, 6)):
+                values = result[group]
+                peak = float(np.max(np.abs(values)))
+                if peak > 0.0:
+                    values[np.abs(values) < snap * peak] = 0.0
+                    result[group] = values
+        return result
 
     def map(self, raw_axes: Sequence[float] | np.ndarray, valid: bool = True) -> np.ndarray:
         """Return ``[dx, dy, dz, rx, ry, rz]`` in metres / axis-angle radians.
@@ -280,7 +317,7 @@ class SixDofMapper:
         if self._neutral_frames >= self.config.neutral_lock_frames:
             self._filtered.fill(0.0)
             self._axis_active.fill(False)
-        mapped = self._filtered[self._axis_order] * self._axis_inversion
+        mapped = self._decouple(self._filtered[self._axis_order] * self._axis_inversion)
         translation = self._control_rotation @ mapped[:3]
         rotation = self._control_rotation @ mapped[3:]
         output = np.concatenate(
@@ -297,6 +334,8 @@ class SixDofMapper:
             "ema_axes": self._filtered.tolist(),
             "final_osc_delta": output.tolist(),
             "axis_active": self._axis_active.tolist(),
+            "decoupled_control_axes": mapped.tolist(),
+            "dominant_group": self._dominant_group,
             "neutral_consecutive_frames": int(self._neutral_frames),
             "neutral_locked": bool(self._neutral_frames >= self.config.neutral_lock_frames),
             "enter_deadzone": self._deadzones.tolist(),

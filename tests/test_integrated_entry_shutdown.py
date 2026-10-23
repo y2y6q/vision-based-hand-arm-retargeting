@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from wrist_teleop import WristConfig  # noqa: E402
+from wrist_teleop.allegro_model import ALLEGRO_PALM_DOWN_NORMAL_LOCAL  # noqa: E402
 from wrist_teleop.runtime_controls import KeyboardCommandRouter  # noqa: E402
 
 
@@ -163,8 +164,19 @@ class IntegratedEntryShutdownTests(unittest.TestCase):
         self.assertEqual(MemoryLog.instances[-1].events[-1]["reason"], "Ctrl+C")
         np.testing.assert_allclose(MemoryLog.instances[-1].events[-1]["last_zero_wrist_action"][:6], np.zeros(6))
 
-    def test_integrated_api_defaults_to_dex_not_legacy_curl(self):
-        self.assertEqual(inspect.signature(ENTRY.run_integrated).parameters["hand_control"].default, "dex")
+    def test_integrated_api_defaults_to_shadow_style_curl_pinch(self):
+        self.assertEqual(inspect.signature(ENTRY.run_integrated).parameters["hand_control"].default, "curl-pinch")
+
+    def test_allegro_laser_is_site_local_working_palm_normal(self):
+        laser = ENTRY._panda_allegro_palm_laser_config(self.config)
+        self.assertEqual(laser.start_site, "palm_laser_site")
+        self.assertEqual(laser.direction_frame, "site")
+        # Palm-down mount: the true palm normal is the hand's local +X.
+        np.testing.assert_allclose(laser.local_direction, ALLEGRO_PALM_DOWN_NORMAL_LOCAL)
+        self.assertEqual(laser.visible_views, ("front", "side"))
+        self.assertTrue(laser.hide_robot_in_wrist_view)
+        tri_view = ENTRY._panda_allegro_tri_view_config(self.config)
+        self.assertEqual(tri_view.wrist_camera_name, "gripper0_right_palm_view_camera")
 
     def test_dex_sidecar_is_closed_after_unified_resource_cleanup(self):
         device = FakeDevice(self.config)

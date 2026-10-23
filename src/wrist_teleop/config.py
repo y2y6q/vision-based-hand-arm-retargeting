@@ -235,8 +235,9 @@ class LaserConfig:
     ``start_site`` provides the true TCP origin and ``visual_site`` names the
     existing transparent MuJoCo cylinder site used only for rendering.  The
     direction normally is expressed in the start site's local coordinate
-    frame.  A caller can instead request a fixed world-frame vector; Panda +
-    Allegro uses that mode for its palm-to-table targeting aid.  View names
+    frame. A caller can instead request a fixed world-frame vector. Panda +
+    Allegro uses its physical palm site's local normal for its palm-to-table
+    targeting aid. View names
     are the compositor's logical ``front``, ``wrist``, and ``side`` panels,
     so camera names can be changed in :class:`TriViewConfig` without
     duplicating this list.
@@ -253,10 +254,16 @@ class LaserConfig:
     world_direction: tuple[float, float, float] = (0.0, 0.0, -1.0)
     visible_views: tuple[str, ...] = ("front", "wrist", "side")
     hide_on_no_hit: bool = False
+    # A palm-mounted camera otherwise sees the wrist / finger geometry inside
+    # its own frustum. This affects only the wrist render, never physics.
+    hide_robot_in_wrist_view: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "enabled", _boolean("laser.enabled", self.enabled))
         object.__setattr__(self, "hide_on_no_hit", _boolean("laser.hide_on_no_hit", self.hide_on_no_hit))
+        object.__setattr__(self, "hide_robot_in_wrist_view", _boolean(
+            "laser.hide_robot_in_wrist_view", self.hide_robot_in_wrist_view
+        ))
         color = _sequence("laser.color_rgba", self.color_rgba, 4)
         parsed_color: list[float] = []
         for index, value in enumerate(color):
@@ -320,6 +327,11 @@ class DexHandConfig:
     input_is_mirrored: bool = False
     runtime: str = "auto"
     sidecar_python: str | None = None
+    # The official solver returns an absolute source-size target. A live
+    # operator can instead map changes from a comfortable camera neutral pose
+    # around the simulated hand's safe-open pose.
+    relative_motion: bool = True
+    relative_motion_gain: float = 1.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "stale_timeout_s", _finite_number(
@@ -336,6 +348,13 @@ class DexHandConfig:
         if runtime not in {"auto", "native", "sidecar"}:
             raise ValueError("dex_hand.runtime must be 'auto', 'native', or 'sidecar'")
         object.__setattr__(self, "runtime", runtime)
+        object.__setattr__(self, "relative_motion", _boolean(
+            "dex_hand.relative_motion", self.relative_motion
+        ))
+        gain = _finite_number("dex_hand.relative_motion_gain", self.relative_motion_gain)
+        if gain > 3.0:
+            raise ValueError("dex_hand.relative_motion_gain must be in (0, 3]")
+        object.__setattr__(self, "relative_motion_gain", gain)
         if self.sidecar_python is not None:
             object.__setattr__(
                 self,
@@ -366,14 +385,26 @@ class WristConfig:
     visually consistent when the shoulder camera moves.  Axis-angle vectors
     describe extrinsic world-axis increments in either case.
 
+    Default axes follow the 3Dconnexion HID convention with the logo facing
+    the operator: report +X = right, +Y = toward the operator, +Z = down,
+    rotations right-handed about those axes. The camera basis is
+    [screen right, away from the operator, up], so translation and rotation
+    both become [X, -Y, -Z]. ``scripts/calibrate_spacemouse_axes.py`` writes
+    the measured order / signs for a specific device.
+
+    ``motion_coupling='dominant'`` passes only the stronger of the
+    translation / rotation groups (with ``dominant_switch_ratio`` hysteresis),
+    so pushing the cap does not also rotate the hand. ``axis_snap_ratio``
+    drops weak off-axis components inside the active group.
+
     Deadzones are fractions of raw_ranges, with continuous linear rescaling
     outside the deadzone. EMA alpha is the new sample weight; None disables
     smoothing. All settings are immutable after validation.
     """
 
     raw_ranges: tuple[float, ...] = (350.0,) * 6
-    axis_order: tuple[int, ...] = (1, 0, 2, 3, 4, 5)
-    axis_inversion: tuple[int, ...] = (1, 1, -1, 1, 1, 1)
+    axis_order: tuple[int, ...] = (0, 1, 2, 3, 4, 5)
+    axis_inversion: tuple[int, ...] = (1, -1, -1, 1, -1, -1)
     device_to_world: tuple[tuple[float, ...], ...] = (
         (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)
     )
@@ -395,8 +426,17 @@ class WristConfig:
     max_translation_delta_m: float = 0.004
     max_rotation_delta_rad: float = 0.04
     smoothing_alpha: float | None = 0.35
+    motion_coupling: str = "dominant"
+    dominant_switch_ratio: float = 1.5
+    axis_snap_ratio: float = 0.3
     control_hz: float = 20.0
     stale_timeout_s: float = 0.25
+    # Some SpaceMouse HID drivers report a button only on its transition,
+    # rather than continuously while it remains pressed. A confirmed pressed
+    # state may therefore stay actionable for this bounded interval. It is
+    # deliberately separate from the much shorter motion stale timeout so a
+    # stationary hand can complete one safe gripper stroke.
+    button_hold_timeout_s: float = 6.0
     discovery_interval_s: float = 0.5
     hand_gestures: HandGestureConfig = DEFAULT_HAND_GESTURE_CONFIG
     tri_view: TriViewConfig = DEFAULT_TRI_VIEW_CONFIG
@@ -461,8 +501,20 @@ class WristConfig:
             object.__setattr__(self, name, int(value))
         for name in ("translation_scale_m", "rotation_scale_rad", "max_translation_delta_m",
                      "max_rotation_delta_rad", "control_hz", "stale_timeout_s",
-                     "discovery_interval_s", "neutral_startup_s"):
+                     "button_hold_timeout_s", "discovery_interval_s", "neutral_startup_s"):
             object.__setattr__(self, name, _finite_number(name, getattr(self, name)))
+        if self.motion_coupling not in ("dominant", "combined"):
+            raise ValueError("motion_coupling must be 'dominant' or 'combined'")
+        ratio = _finite_number("dominant_switch_ratio", self.dominant_switch_ratio)
+        if ratio < 1.0:
+            raise ValueError("dominant_switch_ratio must be at least 1")
+        object.__setattr__(self, "dominant_switch_ratio", ratio)
+        snap = _finite_number("axis_snap_ratio", self.axis_snap_ratio, inclusive=True)
+        if snap >= 1.0:
+            raise ValueError("axis_snap_ratio must be in [0, 1)")
+        object.__setattr__(self, "axis_snap_ratio", snap)
+        if self.button_hold_timeout_s < self.stale_timeout_s:
+            raise ValueError("button_hold_timeout_s must be at least stale_timeout_s")
         if self.smoothing_alpha is not None:
             alpha = _finite_number("smoothing_alpha", self.smoothing_alpha)
             if alpha > 1.0:

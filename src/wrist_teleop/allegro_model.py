@@ -44,6 +44,7 @@ SOURCE_URDF = (
 )
 SOURCE_ASSET_DIR = SOURCE_URDF.parent
 GRIPPER_TYPE = "AllegroRightHand"
+PALM_DOWN_GRIPPER_TYPE = "AllegroRightHandPalmDown"
 _DEFAULT_INITIALIZATION_NOISE = object()
 
 # This is the source URDF declaration order.  Keep it explicit: camera hand
@@ -66,6 +67,44 @@ ALLEGRO_JOINT_NAMES = (
     "joint_14.0",
     "joint_15.0",
 )
+
+# The source URDF's main ``base_link`` collision box is centered at this
+# location.  It is the physical middle of the broad palm, whereas the source
+# ``palm`` link is a virtual wrist-side frame 65 mm behind it.  The broad
+# grasp-working face of the physical palm is local +Z.  In Panda's initial
+# tabletop pose this is the down-facing side that can see the cube and table;
+# the opposite -Z side faces back toward the wrist.  Keep it explicit so the
+# visual aids leave the palm working surface instead of the back of the hand.
+# The custom MuJoCo hand is intentionally two thirds of the source URDF's
+# dimensions.  The source files remain frozen; this value is applied only to
+# the generated runtime MJCF, including meshes, collision geometry, body
+# offsets, masses, and inertia tensors.
+ALLEGRO_GEOMETRY_SCALE = 2.0 / 3.0
+_ALLEGRO_SOURCE_PALM_CENTER_LOCAL = (-0.009, 0.0, -0.023)
+ALLEGRO_PALM_CENTER_LOCAL = tuple(
+    float(value * ALLEGRO_GEOMETRY_SCALE) for value in _ALLEGRO_SOURCE_PALM_CENTER_LOCAL
+)
+# The physical working face of the generated Allegro palm is local +Z.  This
+# shared normal drives both the laser and palm-first-person camera.
+ALLEGRO_PALMAR_NORMAL_LOCAL = (0.0, 0.0, 1.0)
+# Palm-down teleop mount (same convention as the Shadow entry). In the hand
+# root frame the fingers extend along +Z and curl toward +X, so +X is the
+# true palm normal. The hand is turned -90 deg about its Y axis so the
+# fingers point forward over the table and the palm faces it; the back of the
+# palm (root -X face at -20 mm) sits 3 mm off the flange, proximal palm.
+ALLEGRO_PALM_DOWN_NORMAL_LOCAL = (1.0, 0.0, 0.0)
+_ALLEGRO_PALM_DOWN_TILT_WXYZ = (np.sqrt(0.5), 0.0, -np.sqrt(0.5), 0.0)
+_ALLEGRO_PALM_DOWN_DORSUM_LOCAL = (-0.023, 0.0, -0.045)
+# OSC point of the palm-down teleop hand: in front of the palm where curled
+# fingertips meet (hand root frame). SpaceMouse rotations then pivot about the
+# grasp, instead of swinging the fingers around the flange 10+ cm behind them.
+ALLEGRO_PALM_DOWN_GRASP_CENTER_LOCAL = (0.040, 0.0, 0.030)
+ALLEGRO_PALM_VIEW_CAMERA = "palm_view_camera"
+# This is a palm camera, not a fingertip camera. Keep a small 25 mm clearance
+# in front of the palm's working face so MuJoCo does not place the optical
+# centre inside palm collision geometry. The optical axis still starts from
+# the laser's physical palm centre and points along the same local +Z normal.
+ALLEGRO_PALM_VIEW_OFFSET_M = 0.025
 
 
 @dataclass(frozen=True)
@@ -114,13 +153,16 @@ def _rpy_to_matrix(rpy: Sequence[float]) -> np.ndarray:
     )
 
 
-def _origin_attributes(origin: ET.Element | None) -> dict[str, str]:
+def _origin_attributes(origin: ET.Element | None, *, scale: float = 1.0) -> dict[str, str]:
     """Return MJCF ``pos`` / ``quat`` attributes from an optional URDF origin."""
     if origin is None:
         return {}
     attributes: dict[str, str] = {}
     if origin.get("xyz"):
-        attributes["pos"] = origin.get("xyz", "")
+        xyz = np.fromstring(origin.get("xyz", ""), sep=" ", dtype=np.float64)
+        if xyz.shape != (3,):
+            raise ValueError(f"Invalid URDF origin xyz: {origin.get('xyz')!r}")
+        attributes["pos"] = _array_text(xyz * float(scale))
     if origin.get("rpy"):
         attributes["quat"] = _array_text(_rpy_to_wxyz(np.fromstring(origin.get("rpy", ""), sep=" ")))
     return attributes
@@ -178,6 +220,8 @@ def _append_link_content(
     body: ET.Element,
     link: ET.Element,
     mesh_names: dict[Path, str],
+    *,
+    scale: float,
 ) -> None:
     """Translate source visual, inertial, and collision data into one MJCF body."""
     inertial = link.find("inertial")
@@ -185,7 +229,7 @@ def _append_link_content(
         mass = inertial.find("mass")
         inertia = inertial.find("inertia")
         if mass is not None and inertia is not None:
-            attrs = _origin_attributes(inertial.find("origin"))
+            attrs = _origin_attributes(inertial.find("origin"), scale=scale)
             # MuJoCo prohibits an inertial quaternion alongside fullinertia.
             # Rotate the URDF inertia tensor into the body frame instead.
             inertial_origin = inertial.find("origin")
@@ -205,7 +249,7 @@ def _append_link_content(
             )
             rotation = _rpy_to_matrix(rpy)
             inertia_matrix = rotation @ inertia_matrix @ rotation.T
-            attrs["mass"] = mass.attrib["value"]
+            attrs["mass"] = f"{float(mass.attrib['value']) * scale ** 3:.12g}"
             # MuJoCo validates the three principal moments against the rigid
             # body triangle inequality. A few legacy URDF tensors fail that
             # validation. Keep valid tensors exactly; replace only invalid
@@ -215,18 +259,18 @@ def _append_link_content(
             principal = np.linalg.eigvalsh(inertia_matrix)
             if principal[0] <= 0.0 or principal[-1] > float(principal[0] + principal[1]):
                 isotropic = max(float(np.mean(np.abs(principal))), 1e-9)
-                attrs["diaginertia"] = _array_text([isotropic, isotropic, isotropic])
+                attrs["diaginertia"] = _array_text([isotropic * scale ** 5] * 3)
             else:
                 # MuJoCo fullinertia is Ixx Iyy Izz Ixy Ixz Iyz. The source
                 # inertial orientation is represented by the rotation above.
                 attrs["fullinertia"] = _array_text(
                     [
-                        inertia_matrix[0, 0],
-                        inertia_matrix[1, 1],
-                        inertia_matrix[2, 2],
-                        inertia_matrix[0, 1],
-                        inertia_matrix[0, 2],
-                        inertia_matrix[1, 2],
+                        inertia_matrix[0, 0] * scale ** 5,
+                        inertia_matrix[1, 1] * scale ** 5,
+                        inertia_matrix[2, 2] * scale ** 5,
+                        inertia_matrix[0, 1] * scale ** 5,
+                        inertia_matrix[0, 2] * scale ** 5,
+                        inertia_matrix[1, 2] * scale ** 5,
                     ]
                 )
             ET.SubElement(body, "inertial", attrs)
@@ -236,7 +280,7 @@ def _append_link_content(
         if mesh is None:
             continue
         source = _asset_path(mesh.attrib["filename"])
-        attrs = _origin_attributes(visual.find("origin"))
+        attrs = _origin_attributes(visual.find("origin"), scale=scale)
         attrs.update(
             type="mesh",
             mesh=_mesh_name(source, mesh_names),
@@ -249,7 +293,7 @@ def _append_link_content(
         ET.SubElement(body, "geom", attrs)
 
     for collision_index, collision in enumerate(link.findall("collision")):
-        attrs = _origin_attributes(collision.find("origin"))
+        attrs = _origin_attributes(collision.find("origin"), scale=scale)
         attrs.update(
             name=f"{link.get('name')}_collision_{collision_index}",
             group="0",
@@ -268,7 +312,7 @@ def _append_link_content(
             full_size = np.fromstring(box.attrib["size"], sep=" ", dtype=np.float64)
             if full_size.shape != (3,):
                 raise ValueError(f"Invalid Allegro collision box: {box.attrib['size']!r}")
-            attrs.update(type="box", size=_array_text(full_size * 0.5))
+            attrs.update(type="box", size=_array_text(full_size * 0.5 * scale))
         elif mesh is not None:
             source = _asset_path(mesh.attrib["filename"])
             attrs.update(type="mesh", mesh=_mesh_name(source, mesh_names))
@@ -277,8 +321,25 @@ def _append_link_content(
         ET.SubElement(body, "geom", attrs)
 
 
-def _build_mjcf_tree() -> ET.ElementTree:
-    """Build a self-contained robosuite-compatible MJCF tree from the source URDF."""
+def _quat_mul_wxyz(left: Sequence[float], right: Sequence[float]) -> np.ndarray:
+    w1, x1, y1, z1 = left
+    w2, x2, y2, z2 = right
+    return np.array((
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ))
+
+
+def _build_mjcf_tree(palm_down: bool = False) -> ET.ElementTree:
+    """Build a self-contained robosuite-compatible MJCF tree from the source URDF.
+
+    ``palm_down`` keeps every link, joint and actuator but places the hand on
+    a joint-free ``allegro_mount`` root with the palm facing the table. The
+    OSC TCP stays exactly where it was (flange, same orientation), so arm
+    control and Gate 2's default model are unaffected.
+    """
     source_root = ET.parse(SOURCE_URDF).getroot()
     specs = _joint_specs_from_urdf(source_root)
     source_joints = {joint.get("name"): joint for joint in source_root.findall("joint")}
@@ -315,15 +376,32 @@ def _build_mjcf_tree() -> ET.ElementTree:
     # its frame differs by -45 degrees around Z. Therefore the equivalent
     # relative root is +95 mm / +180 degrees about Z. This is retained here
     # rather than silently reusing Panda's two-finger gripper transform.
+    root_pos = np.array((0.0, 0.0, 0.095 * ALLEGRO_GEOMETRY_SCALE))
+    root_quat = np.array((0.0, 0.0, 0.0, 1.0))
+    root_parent = worldbody
+    if palm_down:
+        mount = ET.SubElement(worldbody, "body", {"name": "allegro_mount", "pos": "0 0 0"})
+        root_parent = mount
+        root_quat = _quat_mul_wxyz(root_quat, _ALLEGRO_PALM_DOWN_TILT_WXYZ)
+        w, x, y, z = root_quat
+        rotation = np.array((
+            (1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)),
+            (2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)),
+            (2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)),
+        ))
+        # The flange face is the mount origin (the default root places the
+        # hand's wrist end, root z = -95 mm * scale, exactly there).
+        root_pos = -rotation @ np.asarray(_ALLEGRO_PALM_DOWN_DORSUM_LOCAL)
     root_body = ET.SubElement(
-        worldbody,
+        root_parent,
         "body",
         {
             "name": "allegro_right_hand",
-            "pos": "0 0 0.095",
-            "quat": "0 0 0 1",
+            "pos": _array_text(root_pos),
+            "quat": _array_text(root_quat),
         },
     )
+    palm_normal = ALLEGRO_PALM_DOWN_NORMAL_LOCAL if palm_down else ALLEGRO_PALMAR_NORMAL_LOCAL
     mesh_names: dict[Path, str] = {}
 
     specs_by_name = {spec.name: spec for spec in specs}
@@ -333,7 +411,7 @@ def _build_mjcf_tree() -> ET.ElementTree:
             raise ValueError(f"Allegro joint references unknown link {link_name!r}")
         attrs = {"name": link_name}
         if source_joint is not None:
-            attrs.update(_origin_attributes(source_joint.find("origin")))
+            attrs.update(_origin_attributes(source_joint.find("origin"), scale=ALLEGRO_GEOMETRY_SCALE))
         body = ET.SubElement(parent_body, "body", attrs)
         if source_joint is not None and source_joint.get("type") == "revolute":
             name = str(source_joint.get("name"))
@@ -351,22 +429,7 @@ def _build_mjcf_tree() -> ET.ElementTree:
                 "armature": "0.001",
             }
             ET.SubElement(body, "joint", joint_attrs)
-        _append_link_content(body, links[link_name], mesh_names)
-        if link_name == "palm":
-            # This site is deliberately transparent and has neither geometry
-            # nor contact.  It marks the source URDF's fixed palm frame so the
-            # optional visual laser can start at the palm rather than the OSC
-            # wrist / fingertip reference.
-            ET.SubElement(
-                body,
-                "site",
-                {
-                    "name": "palm_laser_site",
-                    "type": "sphere",
-                    "size": "0.002",
-                    "rgba": "1 0 0 0",
-                },
-            )
+        _append_link_content(body, links[link_name], mesh_names, scale=ALLEGRO_GEOMETRY_SCALE)
         for child_joint in children.get(link_name, []):
             child = child_joint.find("child")
             assert child is not None
@@ -374,7 +437,39 @@ def _build_mjcf_tree() -> ET.ElementTree:
         return body
 
     # Fill the root itself from base_link, then append all URDF child chains.
-    _append_link_content(root_body, links["base_link"], mesh_names)
+    _append_link_content(root_body, links["base_link"], mesh_names, scale=ALLEGRO_GEOMETRY_SCALE)
+    # This transparent, non-contact marker sits at the geometric centre of
+    # the physical palm.  It deliberately does not use the source's virtual
+    # ``palm`` / wrist frame, which is offset behind the palm toward the arm.
+    ET.SubElement(
+        root_body,
+        "site",
+        {
+            "name": "palm_laser_site",
+            "pos": _array_text(ALLEGRO_PALM_CENTER_LOCAL),
+            "type": "sphere",
+            "size": f"{0.002 * ALLEGRO_GEOMETRY_SCALE:.12g}",
+            "rgba": "1 0 0 0",
+        },
+    )
+    # MuJoCo cameras look along local -Z.  With x=+X and y=-Y, local -Z is
+    # the hand's palm-facing local +Z direction, exactly matching the laser.
+    # The camera is immediately in front of the physical palm. MuJoCo cameras
+    # look along local -Z; with x=+X and y=-Y this is the palm-facing +Z ray.
+    palm_view_position = np.asarray(ALLEGRO_PALM_CENTER_LOCAL) + (
+        np.asarray(palm_normal) * ALLEGRO_PALM_VIEW_OFFSET_M
+    )
+    ET.SubElement(
+        root_body,
+        "camera",
+        {
+            "name": ALLEGRO_PALM_VIEW_CAMERA,
+            "pos": _array_text(palm_view_position),
+            # Palm-down: look along +X with the fingers toward the image top.
+            "xyaxes": "0 -1 0 0 0 1" if palm_down else "1 0 0 0 -1 0",
+            "fovy": "70",
+        },
+    )
     for child_joint in children.get("base_link", []):
         child = child_joint.find("child")
         assert child is not None
@@ -383,21 +478,27 @@ def _build_mjcf_tree() -> ET.ElementTree:
     # Explicit TCP / EEF: the legacy source's wrist is base_link -95 mm in its
     # local Z direction (palm -65 mm then wrist -30 mm).  OSC references this
     # site after the gripper is merged into Panda's right_hand mount.
-    eef = ET.SubElement(root_body, "body", {"name": "eef", "pos": "0 0 -0.095"})
-    ET.SubElement(eef, "site", {"name": "ft_frame", "type": "sphere", "size": "0.002", "rgba": "1 0 0 0"})
-    ET.SubElement(eef, "site", {"name": "grip_site", "type": "sphere", "size": "0.005", "rgba": "1 0 0 0"})
+    if palm_down:
+        # Same orientation as the default model's TCP (root's 180-degree Z
+        # mount); position moved to the grasp centre.
+        eef_pos = root_pos + rotation @ np.asarray(ALLEGRO_PALM_DOWN_GRASP_CENTER_LOCAL)
+        eef = ET.SubElement(mount, "body", {"name": "eef", "pos": _array_text(eef_pos), "quat": "0 0 0 1"})
+    else:
+        eef = ET.SubElement(root_body, "body", {"name": "eef", "pos": _array_text((0.0, 0.0, -0.095 * ALLEGRO_GEOMETRY_SCALE))})
+    ET.SubElement(eef, "site", {"name": "ft_frame", "type": "sphere", "size": f"{0.002 * ALLEGRO_GEOMETRY_SCALE:.12g}", "rgba": "1 0 0 0"})
+    ET.SubElement(eef, "site", {"name": "grip_site", "type": "sphere", "size": f"{0.005 * ALLEGRO_GEOMETRY_SCALE:.12g}", "rgba": "1 0 0 0"})
     ET.SubElement(
         eef,
         "site",
-        {"name": "grip_site_cylinder", "type": "cylinder", "size": "0.003 0.08", "rgba": "0 1 0 0"},
+        {"name": "grip_site_cylinder", "type": "cylinder", "size": _array_text((0.003 * ALLEGRO_GEOMETRY_SCALE, 0.08 * ALLEGRO_GEOMETRY_SCALE)), "rgba": "0 1 0 0"},
     )
-    ET.SubElement(eef, "site", {"name": "ee", "type": "sphere", "size": "0.001", "rgba": "0 0 1 0"})
-    ET.SubElement(eef, "site", {"name": "ee_x", "pos": "0.05 0 0", "type": "sphere", "size": "0.001", "rgba": "1 0 0 0"})
-    ET.SubElement(eef, "site", {"name": "ee_y", "pos": "0 0.05 0", "type": "sphere", "size": "0.001", "rgba": "0 1 0 0"})
-    ET.SubElement(eef, "site", {"name": "ee_z", "pos": "0 0 0.05", "type": "sphere", "size": "0.001", "rgba": "0 0 1 0"})
+    ET.SubElement(eef, "site", {"name": "ee", "type": "sphere", "size": f"{0.001 * ALLEGRO_GEOMETRY_SCALE:.12g}", "rgba": "0 0 1 0"})
+    ET.SubElement(eef, "site", {"name": "ee_x", "pos": _array_text((0.05 * ALLEGRO_GEOMETRY_SCALE, 0.0, 0.0)), "type": "sphere", "size": f"{0.001 * ALLEGRO_GEOMETRY_SCALE:.12g}", "rgba": "1 0 0 0"})
+    ET.SubElement(eef, "site", {"name": "ee_y", "pos": _array_text((0.0, 0.05 * ALLEGRO_GEOMETRY_SCALE, 0.0)), "type": "sphere", "size": f"{0.001 * ALLEGRO_GEOMETRY_SCALE:.12g}", "rgba": "0 1 0 0"})
+    ET.SubElement(eef, "site", {"name": "ee_z", "pos": _array_text((0.0, 0.0, 0.05 * ALLEGRO_GEOMETRY_SCALE)), "type": "sphere", "size": f"{0.001 * ALLEGRO_GEOMETRY_SCALE:.12g}", "rgba": "0 0 1 0"})
 
     for source, name in mesh_names.items():
-        ET.SubElement(asset, "mesh", {"name": name, "file": str(source)})
+        ET.SubElement(asset, "mesh", {"name": name, "file": str(source), "scale": _array_text((ALLEGRO_GEOMETRY_SCALE,) * 3)})
 
     # The source URDF intentionally has collision boxes that overlap at every
     # joint interface. MuJoCo reports those as self contacts unless they are
@@ -436,9 +537,9 @@ def _build_mjcf_tree() -> ET.ElementTree:
     return ET.ElementTree(model)
 
 
-def _temporary_mjcf_path() -> Path:
+def _temporary_mjcf_path(palm_down: bool = False) -> Path:
     """Materialize the generated MJCF only long enough for GripperModel to parse it."""
-    tree = _build_mjcf_tree()
+    tree = _build_mjcf_tree(palm_down)
     handle = tempfile.NamedTemporaryFile(prefix="allegro_right_hand_", suffix=".xml", delete=False)
     path = Path(handle.name)
     handle.close()
@@ -476,6 +577,7 @@ def register_allegro_gripper() -> str:
     from robosuite.models.grippers import GRIPPER_MAPPING
 
     GRIPPER_MAPPING[GRIPPER_TYPE] = AllegroRightHand
+    GRIPPER_MAPPING[PALM_DOWN_GRIPPER_TYPE] = AllegroRightHandPalmDown
     return GRIPPER_TYPE
 
 
@@ -487,12 +589,13 @@ class AllegroRightHand(GripperModel):
 
     source_urdf = SOURCE_URDF
     joint_names = ALLEGRO_JOINT_NAMES
+    palm_down = False
 
     def __init__(self, idn: int | str = 0):
         self._joint_specs = source_joint_specs()
         self.lower_limits = np.array([spec.lower for spec in self._joint_specs], dtype=np.float64)
         self.upper_limits = np.array([spec.upper for spec in self._joint_specs], dtype=np.float64)
-        mjcf_path = _temporary_mjcf_path()
+        mjcf_path = _temporary_mjcf_path(self.palm_down)
         try:
             super().__init__(str(mjcf_path), idn=idn)
         finally:
@@ -542,7 +645,9 @@ class AllegroRightHand(GripperModel):
     def describe(self) -> dict[str, Any]:
         """Stable metadata for logs and runtime action-slice assertions."""
         return {
-            "gripper_type": GRIPPER_TYPE,
+            "gripper_type": PALM_DOWN_GRIPPER_TYPE if self.palm_down else GRIPPER_TYPE,
+            "mount": "palm_down" if self.palm_down else "fingers_down",
+            "geometry_scale": ALLEGRO_GEOMETRY_SCALE,
             "source_urdf": str(self.source_urdf),
             "dof": self.dof,
             "joint_names": list(self.joint_names),
@@ -570,11 +675,17 @@ class AllegroRightHand(GripperModel):
 
     @property
     def horizontal_radius(self) -> float:
-        return 0.13
+        return 0.13 * ALLEGRO_GEOMETRY_SCALE
 
 
 # Import-time registration is intentionally explicit: robosuite's factory only
 # accepts class names already present in GRIPPER_MAPPING.
+class AllegroRightHandPalmDown(AllegroRightHand):
+    """Same 16-joint hand and action contract, mounted palm-down for teleop."""
+
+    palm_down = True
+
+
 register_allegro_gripper()
 
 
@@ -582,6 +693,7 @@ def make_allegro_panda_env(
     config: Any,
     *,
     has_renderer: bool,
+    palm_down: bool = False,
     has_offscreen_renderer: bool = False,
     initialization_noise: Any = _DEFAULT_INITIALIZATION_NOISE,
     hard_reset: bool = True,
@@ -619,7 +731,7 @@ def make_allegro_panda_env(
     return suite.make(
         "Lift",
         robots="Panda",
-        gripper_types=GRIPPER_TYPE,
+        gripper_types=PALM_DOWN_GRIPPER_TYPE if palm_down else GRIPPER_TYPE,
         controller_configs=controller_config,
         has_renderer=has_renderer,
         has_offscreen_renderer=has_offscreen_renderer,

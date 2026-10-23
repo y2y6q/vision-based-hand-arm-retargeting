@@ -22,12 +22,44 @@ def config(**overrides) -> WristConfig:
                     translation_release_deadzone=0.0, rotation_release_deadzone=0.0,
                     translation_scale_m=0.01, rotation_scale_rad=0.1,
                     max_translation_delta_m=1.0, max_rotation_delta_rad=1.0,
-                    smoothing_alpha=None, control_frame="world")
+                    smoothing_alpha=None, control_frame="world",
+                    # The base pipeline is tested with all six axes passed
+                    # through; decoupling has its own tests below.
+                    motion_coupling="combined", axis_snap_ratio=0.0)
     settings.update(overrides)
     return WristConfig(**settings)
 
 
 class MapperTests(unittest.TestCase):
+    def test_default_axes_follow_hid_convention_in_camera_basis(self):
+        # HID +X right, +Y toward the operator, +Z down -> [right, away, up].
+        defaults = WristConfig()
+        self.assertEqual(defaults.axis_order, (0, 1, 2, 3, 4, 5))
+        self.assertEqual(defaults.axis_inversion, (1, -1, -1, 1, -1, -1))
+        mapper = SixDofMapper(config(axis_order=defaults.axis_order, axis_inversion=defaults.axis_inversion))
+        np.testing.assert_allclose(mapper.map([0, -350, 0, 0, 0, 0])[:3], [0, 0.01, 0])  # push away
+        np.testing.assert_allclose(mapper.map([350, 0, 0, 0, 0, 0])[:3], [0.01, 0, 0])  # push right
+        np.testing.assert_allclose(mapper.map([0, 0, -350, 0, 0, 0])[:3], [0, 0, 0.01])  # lift
+
+    def test_dominant_group_drops_cross_talk_with_hysteresis(self):
+        mapper = SixDofMapper(config(motion_coupling="dominant", dominant_switch_ratio=1.5))
+        push = mapper.map([350, 0, 0, 120, 0, 0])  # push with incidental tilt
+        np.testing.assert_allclose(push, [0.01, 0, 0, 0, 0, 0])
+        self.assertEqual(mapper.diagnostics()["dominant_group"], "translation")
+        held = mapper.map([200, 0, 0, 250, 0, 0])  # tilt grows, but below 1.5x
+        np.testing.assert_array_equal(held[3:], np.zeros(3))
+        switched = mapper.map([100, 0, 0, 350, 0, 0])
+        np.testing.assert_array_equal(switched[:3], np.zeros(3))
+        self.assertGreater(switched[3], 0.0)
+        mapper.map([0] * 6)
+        self.assertIsNone(mapper.diagnostics()["dominant_group"])
+
+    def test_axis_snap_removes_weak_off_axis_components(self):
+        mapper = SixDofMapper(config(axis_snap_ratio=0.3))
+        np.testing.assert_allclose(mapper.map([350, 70, -35, 0, 0, 0]), [0.01, 0, 0, 0, 0, 0])
+        diagonal = mapper.map([350, 300, 0, 0, 0, 0])
+        self.assertGreater(diagonal[1], 0.0)
+
     def test_deadzone_and_boundary_are_exact_zero(self):
         mapper = SixDofMapper(config(raw_ranges=(100,) * 6,
                                     translation_deadzone=0.1, rotation_deadzone=0.2))
@@ -235,7 +267,7 @@ class ConfigTests(unittest.TestCase):
     def test_invalid_numeric_settings(self):
         positive = ("translation_scale_m", "rotation_scale_rad", "max_translation_delta_m",
                     "max_rotation_delta_rad", "control_hz", "stale_timeout_s",
-                    "discovery_interval_s", "neutral_startup_s")
+                    "button_hold_timeout_s", "discovery_interval_s", "neutral_startup_s")
         for field in positive:
             for value in (0, -1, float("nan"), float("inf"), True, "1", None):
                 with self.subTest(field=field, value=value), self.assertRaises(ValueError):
@@ -247,6 +279,8 @@ class ConfigTests(unittest.TestCase):
                     WristConfig.from_dict({field: value})
         with self.assertRaises(ValueError):
             WristConfig(translation_deadzone=0.05, translation_release_deadzone=0.06)
+        with self.assertRaises(ValueError):
+            WristConfig(stale_timeout_s=0.5, button_hold_timeout_s=0.49)
         for field in ("zero_bias_calibration_frames", "neutral_lock_frames"):
             for value in (0, -1, 1.5, True, "3", 121):
                 with self.subTest(field=field, value=value), self.assertRaises(ValueError):

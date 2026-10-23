@@ -33,7 +33,20 @@ class Landmark:
 
 
 def hand() -> list[Landmark]:
-    return [Landmark(float(index) / 100.0, float(index) / 200.0, -float(index) / 300.0) for index in range(21)]
+    """A non-degenerate open right hand in MediaPipe world coordinates."""
+
+    values = np.array(
+        (
+            (0.000, 0.000, 0.000),  # wrist
+            (0.020, -0.004, 0.005), (0.030, 0.006, 0.007), (0.040, 0.016, 0.006), (0.050, 0.024, 0.004),
+            (0.030, 0.000, 0.000), (0.034, 0.026, 0.003), (0.036, 0.050, 0.005), (0.038, 0.070, 0.006),
+            (0.000, 0.050, 0.000), (0.000, 0.080, 0.002), (0.000, 0.105, 0.003), (0.000, 0.125, 0.004),
+            (-0.026, 0.040, 0.000), (-0.030, 0.066, 0.002), (-0.032, 0.088, 0.003), (-0.034, 0.106, 0.004),
+            (-0.044, 0.012, 0.000), (-0.052, 0.032, 0.002), (-0.057, 0.049, 0.003), (-0.060, 0.064, 0.004),
+        ),
+        dtype=np.float64,
+    )
+    return [Landmark(*point) for point in values]
 
 
 class FakeRetargeter:
@@ -55,21 +68,38 @@ class FakeRetargeter:
 
 
 class DexRetargetingTests(unittest.TestCase):
-    def test_mediapipe_world_frame_is_wrist_relative_and_uses_documented_axes(self):
+    def test_mediapipe_world_frame_matches_official_wrist_frame_convention(self):
         points = hand()
         converted = mediapipe_world_to_mano(points, handedness="Right")
         self.assertEqual(converted.shape, (21, 3))
         np.testing.assert_allclose(converted[0], np.zeros(3))
-        source_delta = np.array((points[4].x, points[4].y, points[4].z)) - np.array(
-            (points[0].x, points[0].y, points[0].z)
+        # In this synthetic palm, the middle MCP lies on the official MANO
+        # +Z direction, while index MCP lies on +Y after palm normalization.
+        np.testing.assert_allclose(converted[9], np.array((0.0, 0.0, 0.05)), atol=1e-12)
+        np.testing.assert_allclose(converted[5], np.array((0.0, 0.03, 0.0)), atol=1e-12)
+
+    def test_palm_local_mano_frame_is_invariant_to_webcam_orientation(self):
+        points = hand()
+        source = np.array([(point.x, point.y, point.z) for point in points])
+        # Simulate the same hand seen after a 90-degree camera-frame yaw.
+        camera_rotation = np.array(((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)))
+        rotated = [Landmark(*point) for point in source @ camera_rotation]
+        np.testing.assert_allclose(
+            mediapipe_world_to_mano(rotated, handedness="Right"),
+            mediapipe_world_to_mano(points, handedness="Right"),
+            atol=1e-12,
         )
-        np.testing.assert_allclose(converted[4], np.array((-source_delta[2], -source_delta[0], source_delta[1])))
 
     def test_handedness_and_shape_are_rejected_explicitly(self):
         with self.assertRaises(DexFrameRejected):
             mediapipe_world_to_mano(hand(), handedness="Left")
         with self.assertRaises(DexFrameRejected):
             mediapipe_world_to_mano(hand()[:20], handedness="Right")
+
+    def test_degenerate_palm_is_rejected_before_it_can_move_the_robot_hand(self):
+        collinear = [Landmark(float(index), 0.0, 0.0) for index in range(21)]
+        with self.assertRaisesRegex(DexFrameRejected, "degenerate"):
+            mediapipe_world_to_mano(collinear, handedness="Right")
 
     def test_adapter_clips_named_dex_targets_and_resets_solver_history(self):
         lower = np.array([-0.2] * 16)
@@ -94,6 +124,53 @@ class DexRetargetingTests(unittest.TestCase):
         self.assertFalse(reset.valid)
         self.assertEqual(solver.reset_calls, 1)
         self.assertEqual(reset.details["history_reset"], True)
+
+    def test_relative_camera_neutral_maps_official_pose_changes_around_safe_open(self):
+        """The first valid right-hand pose is neutral; later dex motion remains visible."""
+
+        class ChangingSolver(FakeRetargeter):
+            def __init__(self):
+                super().__init__()
+                self.offset = 0.0
+
+            def retarget(self, _mano):
+                values = np.linspace(-0.5, 0.5, 16) + self.offset
+                return DexRetargetingResult(
+                    joint_targets_rad=values,
+                    raw_qpos=values,
+                    ref_value=np.ones((4, 3)),
+                    human_indices=np.array(((0, 0, 0, 0), (4, 8, 12, 16))),
+                    retargeting_joint_names=tuple(f"joint_{index}.0" for index in range(16)),
+                )
+
+        solver = ChangingSolver()
+        lower = np.array([-2.0] * 16)
+        upper = np.array([2.0] * 16)
+        adapter = DexHandInputAdapter(
+            solver, lower_limits=lower, upper_limits=upper,
+            joint_names=tuple(f"joint_{index}.0" for index in range(16)),
+            relative_motion=True, relative_motion_gain=1.0,
+        )
+        neutral = adapter.update_world_landmarks(hand(), "Right", timestamp_s=10.0)
+        np.testing.assert_allclose(neutral.joint_targets, np.zeros(16))
+        self.assertEqual(neutral.details["relative_reference_event"], "captured_first_valid_frame")
+        solver.offset = 0.25
+        moved = adapter.update_world_landmarks(hand(), "Right", timestamp_s=10.1)
+        np.testing.assert_allclose(moved.joint_targets, np.full(16, 0.25))
+        self.assertTrue(adapter.recenter_relative_motion())
+        solver.offset = 0.50
+        moved_after_recenter = adapter.update_world_landmarks(hand(), "Right", timestamp_s=10.2)
+        np.testing.assert_allclose(moved_after_recenter.joint_targets, np.full(16, 0.25))
+
+    def test_relative_camera_neutral_can_be_disabled_for_absolute_official_targets(self):
+        adapter = DexHandInputAdapter(
+            FakeRetargeter(), lower_limits=np.array([-2.0] * 16), upper_limits=np.array([2.0] * 16),
+            joint_names=tuple(f"joint_{index}.0" for index in range(16)), relative_motion=False,
+        )
+        command = adapter.update_world_landmarks(hand(), "Right", timestamp_s=10.0)
+        self.assertFalse(command.details["relative_motion"])
+        self.assertFalse(adapter.recenter_relative_motion())
+        self.assertEqual(adapter.calibration_state, "absolute official dex vector target")
 
     def test_detector_loss_holds_once_then_expires_to_safe_open_policy(self):
         adapter = DexHandInputAdapter(
@@ -125,10 +202,15 @@ class DexRetargetingTests(unittest.TestCase):
 
     def test_dex_camera_loss_policy_comes_from_the_shared_wrist_config(self):
         config = WristConfig.from_dict(
-            {"dex_hand": {"stale_timeout_s": 0.35, "expected_handedness": "Right", "input_is_mirrored": False}}
+            {"dex_hand": {
+                "stale_timeout_s": 0.35, "expected_handedness": "Right", "input_is_mirrored": False,
+                "relative_motion": True, "relative_motion_gain": 1.25,
+            }}
         )
         self.assertEqual(config.dex_hand.stale_timeout_s, 0.35)
         self.assertEqual(config.dex_hand.expected_handedness, "Right")
+        self.assertTrue(config.dex_hand.relative_motion)
+        self.assertEqual(config.dex_hand.relative_motion_gain, 1.25)
 
     def test_dex_frame_path_does_not_invoke_the_legacy_curl_estimator(self):
         """A valid dex frame must reach only the solver / named-joint path."""
@@ -211,17 +293,19 @@ class DexRetargetingTests(unittest.TestCase):
                 lower_limits=[-100.0] * 16,
                 upper_limits=[100.0] * 16,
                 runtime="native",
+                reference_landmark_scale=2.0 / 3.0,
             )
             mano = np.arange(63, dtype=np.float64).reshape(21, 3) / 100.0
             result = adapter.retarget(mano)
             adapter.reset()
 
-        expected_ref = mano[[4, 8, 12, 16]] - mano[[0, 0, 0, 0]]
+        expected_ref = (mano[[4, 8, 12, 16]] - mano[[0, 0, 0, 0]]) * (2.0 / 3.0)
         np.testing.assert_allclose(solver.retarget_arguments, [expected_ref])
         np.testing.assert_allclose(result.ref_value, expected_ref)
         np.testing.assert_allclose(result.raw_qpos, np.arange(16, dtype=np.float64))
         np.testing.assert_allclose(result.joint_targets_rad, np.arange(15, -1, -1, dtype=np.float64))
         self.assertEqual(result.retargeting_joint_names, solver_names)
+        self.assertEqual(adapter.metadata()["reference_landmark_scale"], 2.0 / 3.0)
         self.assertEqual(solver.reset_calls, 1)
         self.assertEqual(solver.filter.reset_calls, 1)
 

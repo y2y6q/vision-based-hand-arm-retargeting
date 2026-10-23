@@ -10,3 +10,9 @@
 
 当前 Windows `.venv-robosuite` 缺少 dex-retargeting 所需的 Pinocchio 二进制依赖，因此
 `--hand-control dex` 会明确报错，不会退回到规则式 curl。
+
+## Shadow DexPilot (LIBERO Shadow entry)
+
+- `shadow_hand_right_dexpilot.yml` is derived from upstream `dex_retargeting/configs/teleop/shadow_hand_right_dexpilot.yml` (0.4.6, MIT).
+- Only change: `target_joint_names` omits `WRJ2` / `WRJ1`, so the SpaceMouse owns the wrist and the sidecar holds both at 0.
+- URDF root: `third_party/dex_urdf` (see its PROVENANCE.md).

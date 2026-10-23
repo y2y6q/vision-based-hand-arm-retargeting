@@ -255,17 +255,21 @@ def _build_state(request: dict[str, Any]) -> WorkerState:
         raise DexInitializationError(
             f"official dex solver metadata is unavailable: {type(exc).__name__}: {exc}"
         ) from exc
+    # Hand-specific shapes (Allegro vector: 2x4 / 16 joints; Shadow DexPilot:
+    # 2x15 / 24 joints) are enforced by the parent adapter for that hand.
     if (
-        human_indices.shape != (2, 4)
+        human_indices.ndim != 2
+        or human_indices.shape[0] != 2
+        or human_indices.shape[1] < 1
         or np.any(human_indices < 0)
         or np.any(human_indices >= 21)
     ):
         raise DexInitializationError(
-            "official Allegro vector configuration must expose a finite 2x4 human-index matrix within 21 landmarks"
+            "official dex configuration must expose a 2xN human-index matrix within 21 landmarks"
         )
-    if len(joint_names) != 16 or len(set(joint_names)) != 16:
+    if not joint_names or len(set(joint_names)) != len(joint_names):
         raise DexInitializationError(
-            "official Allegro vector configuration must expose 16 distinct output joint names"
+            "official dex configuration must expose distinct output joint names"
         )
     return WorkerState(
         retargeting=retargeting,
@@ -358,11 +362,18 @@ class DexRetargetingWorker:
             state = self._require_state()
             landmarks = _landmarks_from_request(request)
             ref_value = landmarks[state.human_indices[1], :] - landmarks[state.human_indices[0], :]
-            if ref_value.shape != (4, 3) or not np.all(np.isfinite(ref_value)):
+            if ref_value.shape != (state.human_indices.shape[1], 3) or not np.all(np.isfinite(ref_value)):
                 raise InvalidLandmarks("official vector reference computed from landmarks is invalid")
             try:
+                # Joints a config leaves out of target_joint_names (Shadow's
+                # SpaceMouse-owned wrist) are held at zero.
+                fixed_count = len(getattr(state.retargeting.optimizer, "idx_pin2fixed", ()))
                 with contextlib.redirect_stdout(sys.stderr):
-                    raw_qpos = np.asarray(state.retargeting.retarget(ref_value), dtype=np.float64).reshape(-1)
+                    if fixed_count:
+                        solved = state.retargeting.retarget(ref_value, fixed_qpos=np.zeros(fixed_count))
+                    else:
+                        solved = state.retargeting.retarget(ref_value)
+                    raw_qpos = np.asarray(solved, dtype=np.float64).reshape(-1)
             except Exception as exc:
                 raise RetargetingError(
                     f"official dex retarget call failed: {type(exc).__name__}: {exc}"

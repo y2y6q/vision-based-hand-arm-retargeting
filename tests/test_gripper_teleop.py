@@ -14,12 +14,16 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from wrist_teleop.config import WristConfig  # noqa: E402
 from wrist_teleop.gripper_teleop import (  # noqa: E402
+    GRIPPER_TELEOP_SPECS,
     GripperButtonController,
     JACO_GRIPPER_POLICY_TARGET_RATE_PER_S,
     JacoContinuousGripperButtonController,
     OneDofGripperComposer,
+    ROBOTIQ_THREE_FINGER_GRIPPER_POLICY_TARGET_RATE_PER_S,
     ROBOT_GRIPPER_EXPECTATIONS,
+    THREE_FINGER_GRIPPER_POLICY_TARGET_RATE_PER_S,
     _OptionalVisualAssistance,
+    apply_jaco_gripper_speed,
     create_gripper_osc_pose_env,
     reset_gripper_environment,
 )
@@ -60,6 +64,14 @@ class OneDofGripperTeleopTests(unittest.TestCase):
 
     def _env(self, robot: str):
         env = create_gripper_osc_pose_env(self.config, robot=robot, has_renderer=False)
+        self.addCleanup(env.close)
+        env.reset()
+        return env
+
+    def _env_pair(self, robot: str, gripper_type: str):
+        env = create_gripper_osc_pose_env(
+            self.config, robot=robot, gripper_type=gripper_type, has_renderer=False
+        )
         self.addCleanup(env.close)
         env.reset()
         return env
@@ -218,7 +230,7 @@ class OneDofGripperTeleopTests(unittest.TestCase):
         self.assertEqual(short.rising_edges, ("left_close",))
         self.assertAlmostEqual(
             short.value,
-            JACO_GRIPPER_POLICY_TARGET_RATE_PER_S * 0.04,
+            THREE_FINGER_GRIPPER_POLICY_TARGET_RATE_PER_S * 0.04,
         )
         retained_target = controller.target
         released = controller.update((False, False), valid=True, dt_s=0.50)
@@ -245,6 +257,34 @@ class OneDofGripperTeleopTests(unittest.TestCase):
         for _ in range(4):
             split_steps.update((True, False), valid=True, dt_s=0.05)
         self.assertAlmostEqual(one_step.target, split_steps.target)
+
+    def test_robotiq_three_finger_uses_a_faster_bounded_button_ramp(self):
+        """Robotiq reaches its existing legal full command sooner than Jaco."""
+
+        self.assertGreaterEqual(
+            ROBOTIQ_THREE_FINGER_GRIPPER_POLICY_TARGET_RATE_PER_S,
+            JACO_GRIPPER_POLICY_TARGET_RATE_PER_S,
+        )
+        rates = {
+            (item.robot, item.gripper_type): item.continuous_rate_per_s
+            for item in GRIPPER_TELEOP_SPECS
+            if item.continuous_buttons
+        }
+        self.assertEqual(
+            rates[("Panda", "RobotiqThreeFingerGripper")],
+            ROBOTIQ_THREE_FINGER_GRIPPER_POLICY_TARGET_RATE_PER_S,
+        )
+        controller = JacoContinuousGripperButtonController(
+            self.config,
+            open_command=-1.0,
+            close_command=1.0,
+            rate_per_s=ROBOTIQ_THREE_FINGER_GRIPPER_POLICY_TARGET_RATE_PER_S,
+        )
+        first = controller.update((True, False), valid=True, dt_s=1.0 / self.config.control_hz)
+        second = controller.update((True, False), valid=True, dt_s=1.0 / self.config.control_hz)
+        self.assertAlmostEqual(first.value, 0.6)
+        self.assertEqual(second.value, 1.0)
+        self.assertEqual(second.state, "close_limit")
 
     def test_jaco_button_limits_dual_press_and_arm_slice_isolation(self):
         controller = JacoContinuousGripperButtonController(
@@ -313,6 +353,95 @@ class OneDofGripperTeleopTests(unittest.TestCase):
         release_action = composer.compose(np.zeros(6), released.value)
         np.testing.assert_allclose(release_action[composer.arm_slice], 0.0)
         np.testing.assert_allclose(release_action[composer.gripper_slice], 0.0)
+
+    def test_jaco_fast_sweep_reaches_full_stroke_and_survives_reset(self):
+        """The Jaco entry closes fully within one second instead of ten."""
+
+        env = self._env("Jaco")
+        self.assertEqual(apply_jaco_gripper_speed(env), 1)
+        composer = OneDofGripperComposer(env)
+        gripper = env.robots[0].gripper[composer.gripper_key]
+        controller = JacoContinuousGripperButtonController(
+            self.config, open_command=composer.gripper_low, close_command=composer.gripper_high,
+        )
+        start = float(np.asarray(gripper.current_action).reshape(-1)[0])
+        for _ in range(20):  # 1.0 s at 20 Hz
+            command = controller.update((True, False), valid=True, dt_s=1.0 / self.config.control_hz)
+            action = composer.compose(np.zeros(6), command.value)
+            np.testing.assert_allclose(action[composer.arm_slice], 0.0)
+            env.step(action)
+        final = float(np.asarray(gripper.current_action).reshape(-1)[0])
+        # The stock 0.01 / step would travel only 0.2 in these 20 steps.
+        self.assertGreaterEqual(abs(final - start), 0.99)
+        self.assertAlmostEqual(abs(final), 1.0)
+        released = controller.update((False, False), valid=True, dt_s=1.0 / self.config.control_hz)
+        held = np.asarray(gripper.current_action).copy()
+        env.step(composer.compose(np.zeros(6), released.value))
+        np.testing.assert_allclose(gripper.current_action, held)
+        env.reset()  # hard reset rebuilds the gripper; reapply as the entry does
+        self.assertEqual(apply_jaco_gripper_speed(env), 1)
+
+    def test_both_official_three_finger_grippers_hold_to_travel_and_release_to_zero(self):
+        """Both Jaco and Panda+Robotiq use current button levels, not edges."""
+
+        pairs = [
+            (item.robot, item.gripper_type)
+            for item in GRIPPER_TELEOP_SPECS
+            if item.fingers == 3 and item.continuous_buttons
+        ]
+        self.assertEqual(
+            pairs,
+            [("Jaco", "JacoThreeFingerGripper"), ("Panda", "RobotiqThreeFingerGripper")],
+        )
+        for robot, gripper_type in pairs:
+            with self.subTest(robot=robot, gripper=gripper_type):
+                env = self._env_pair(robot, gripper_type)
+                composer = OneDofGripperComposer(env)
+                qpos_ids = np.asarray(
+                    env.robots[0]._ref_gripper_joint_pos_indexes[composer.gripper_key], dtype=np.intp
+                )
+                initial = env.sim.data.qpos[qpos_ids].copy()
+                controller = JacoContinuousGripperButtonController(
+                    self.config,
+                    open_command=composer.gripper_low,
+                    close_command=composer.gripper_high,
+                )
+                commands = []
+                # The slow Jaco model advances its normalized closure by
+                # 0.01 per 20 Hz policy step, so six seconds covers a full
+                # stroke for both official three-finger implementations.
+                for _ in range(120):
+                    command = controller.update(
+                        (True, False), valid=True, dt_s=1.0 / self.config.control_hz
+                    )
+                    commands.append(command.value)
+                    env.step(composer.compose(np.zeros(6), command.value))
+                moved = env.sim.data.qpos[qpos_ids].copy()
+                self.assertGreater(np.linalg.norm(moved - initial), 1.0e-4)
+                self.assertTrue(any(abs(value) > 0.0 for value in commands[1:]))
+                released = controller.update((False, False), valid=True, dt_s=1.0 / self.config.control_hz)
+                self.assertEqual(released.value, 0.0)
+                action = composer.compose(np.zeros(6), released.value)
+                np.testing.assert_allclose(action[composer.arm_slice], 0.0)
+                np.testing.assert_allclose(action[composer.gripper_slice], 0.0)
+
+    def test_neutral_mapper_produces_exact_zero_arm_action_for_three_finger_entry(self):
+        """A long stationary interval cannot leave a filtered wrist command."""
+
+        env = self._env_pair("Panda", "RobotiqThreeFingerGripper")
+        composer = OneDofGripperComposer(env)
+        composer.initialize_goal()
+        eef_site_id = env.robots[0].eef_site_id["right"]
+        start_position = env.sim.data.site_xpos[eef_site_id].copy()
+        mapper = SixDofMapper(WristConfig())
+        mapper.map(np.full(6, 350.0), valid=True)
+        for _ in range(600):  # 30 seconds at the configured 20 Hz rate
+            action = composer.compose(mapper.map(np.zeros(6), valid=True), 0.0)
+            np.testing.assert_array_equal(action[composer.arm_slice], np.zeros(6))
+            env.step(action)
+        self.assertTrue(mapper.diagnostics()["neutral_locked"])
+        end_position = env.sim.data.site_xpos[eef_site_id].copy()
+        self.assertLess(float(np.linalg.norm(end_position - start_position)), 1.0e-3)
 
 
 if __name__ == "__main__":

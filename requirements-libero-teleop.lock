@@ -1,0 +1,5 @@
+# Install only into .venv-libero. Do not add these to the robosuite mainline lock.
+hidapi==0.15.0
+# 0.10.21 has no CPython 3.8 Windows wheel on the configured package index.
+# This is the newest compatible MediaPipe release available for this isolated venv.
+mediapipe==0.10.11

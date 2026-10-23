@@ -1,6 +1,6 @@
 # robosuite mainline run instructions
 
-Run every command in PowerShell. The active mainline uses E:\hand_arm_retargeting\.venv-robosuite.
+Use the PyCharm Terminal (Alt+F12) for every command. The active mainline uses E:\hand_arm_retargeting\.venv-robosuite.
 
 ~~~powershell
 Set-Location "E:\hand_arm_retargeting"
@@ -16,6 +16,16 @@ $PY = ".\.venv-robosuite\Scripts\python.exe"
 - Frozen reference baseline: legacy PyBullet / panda-gym files are hash-audited and are outside mainline changes.
 - Verified progress: Panda + Allegro, PandaGripper, Jaco, synchronized three-view rendering, Gate 2 regression, and the isolated official dex-retargeting sidecar.
 - Manual validation still required: live SpaceMouse axes and neutral behavior, camera landmarks, right-hand dex motion, button isolation, and safe R/Q/Ctrl+C cleanup during a live session.
+
+## PyCharm setup before running
+
+1. Open `E:\hand_arm_retargeting` in PyCharm.
+2. Open **File -> Settings -> Project: hand_arm_retargeting -> Python Interpreter**.
+3. For every robosuite entry, select the existing interpreter `E:\hand_arm_retargeting\.venv-robosuite\Scripts\python.exe`.
+4. Select `E:\hand_arm_retargeting\.venv-libero\Scripts\python.exe` only for `scripts/run_libero_task_preview.py`, `scripts/run_libero_spatial_panda_shadow_teleop.py`, and `scripts/run_libero_spatial_panda_robotiq_three_finger_teleop.py`.
+5. Open **Terminal** with Alt+F12 and use the commands below. Do not use the toolbar configuration named `python -m pip install -e .\third_party\panda-gym`; it installs a dependency and does not start a simulation.
+
+To create a green-triangle configuration for an entry: right-click its script in the Project pane, choose **Modify Run Configuration**, set **Working directory** to `E:\hand_arm_retargeting`, and put only the documented arguments after the script name in **Parameters**. PyCharm normally shares one project interpreter, so keep `.venv-robosuite` selected for all mainline entries; temporarily switch the project interpreter to `.venv-libero` only while launching a LIBERO entry.
 
 
 ## 1. Environment and dependencies
@@ -44,6 +54,16 @@ Only the sidecar sets KMP_DUPLICATE_LIB_OK=TRUE for the current Conda OpenMP DLL
 
 ## 2. SpaceMouse diagnostic
 
+Direction calibration (run once per device, about 40 s): it asks for six held gestures with the logo facing you (push away, push right, lift, tilt the top away, tilt the top right, twist clockwise) and writes axis_order / axis_inversion into configs\spacemouse_wrist.json after backing it up to outputs\spacemouse_axis_calibration. Every robosuite and LIBERO entry reads the same file.
+
+~~~powershell
+& $PY .\scripts\calibrate_spacemouse_axes.py
+& $PY .\scripts\calibrate_spacemouse_axes.py --dry-run
+~~~
+
+By default only the stronger of the translation / rotation groups is passed each step (motion_coupling "dominant", dominant_switch_ratio, axis_snap_ratio in the config), so pushing the cap does not also rotate the hand. Set "motion_coupling": "combined" for simultaneous translation and rotation.
+
+
 The diagnostic reports device discovery, raw six-axis values, calibrated values, offset, deadzone and smoothing output, final OSC action, button states, frequency, and disconnect errors. Keep the device centered during the initial eight-frame neutral calibration. Missing, stale, or disconnected input produces an exact zero action.
 
 ~~~powershell
@@ -61,34 +81,42 @@ In 3DxWare, disable mouse-wheel emulation, system clicks, radial menus, and driv
 
 ## 3. Interactive entry points
 
-Panda + Allegro defaults to official dex hand control. When two hands are detected, the runtime selects landmarks for the detected right hand instead of assuming hand index zero. runtime=auto accepts only an official native dex runtime or the official sidecar. If neither works, startup fails explicitly and never falls back silently to a rule-based mapping.
+Panda + Allegro defaults to curl-pinch, the same rule-based mapping as the Shadow entry (per-finger curl plus a thumb-to-fingertip pinch cue that moves the thumb into a model-fitted opposition pose). The hand is mounted palm-down (palm parallel to the table at rest, fingers forward); the laser and palm view follow the true palm normal. Pass --hand-control dex for official dex control. When two hands are detected, the runtime selects landmarks for the detected right hand instead of assuming hand index zero. runtime=auto accepts only an official native dex runtime or the official sidecar. If neither works, startup fails explicitly and never falls back silently to a rule-based mapping.
 
 ~~~powershell
 & $PY .\scripts\run_spacemouse_panda_wrist_teleop.py integrated
+& $PY .\scripts\run_spacemouse_panda_wrist_teleop.py integrated --hand-control dex
 & $PY .\scripts\run_spacemouse_panda_wrist_teleop.py integrated --hand-control legacy-curl
 & $PY .\scripts\run_spacemouse_panda_jaw_gripper_teleop.py
+& $PY .\scripts\run_spacemouse_panda_robotiq85_teleop.py
 & $PY .\scripts\run_spacemouse_jaco_three_finger_teleop.py
+& $PY .\scripts\run_spacemouse_panda_robotiq_three_finger_teleop.py
+
+# Panda + RobotiqThreeFingerGripper defaults to the faster 12 policy-units/s
+# command ramp. Hold left to close and right to open; release holds. Override
+# only if a slower response is needed, for example: --gripper-rate 6
+& $PY .\scripts\run_spacemouse_panda_shadow_hand_teleop.py
 ~~~
 
 The default simulation viewer is a synchronized three-view composite: shoulder-back main view, wrist view, and side view. It renders at native 1920 x 1080: a 1530 x 1080 main image and two 380 x 535 auxiliary images. SpaceMouse motion is transformed from the main camera basis (screen-right, viewing depth, world-up) to world-coordinate OSC_POSE commands. Confirm physical axis directions manually.
 
-Panda + Allegro also opens a live camera status window by default. Use --no-camera-display to hide it or --headless to create no windows. R resets. Q and Ctrl+C quit safely. R and Q work in both the camera and three-view windows; closing either window also triggers safe shutdown.
+Panda + Allegro also opens a live camera status window by default. The normal Windows camera path is mirrored before MediaPipe so the operator's physical right hand is reported as Right and can drive the right Allegro hand. If a camera driver already returns mirrored frames, append --camera-no-mirror. Use --no-camera-display to hide the status window or --headless to create no windows. Present an open physical right hand after startup; the first valid dex frame becomes the relative neutral. Press C in either window to use the current valid hand pose as the new neutral. R resets and clears that neutral. Q and Ctrl+C quit safely. Closing either window also triggers safe shutdown.
 
-For Panda + Allegro, the two SpaceMouse buttons toggle Allegro gestures on rising edges. PandaGripper uses HID bit 0 to close and bit 1 to open. Jaco requires the corresponding button to remain held for continuous opening or closing; release stops motion immediately. Confirm physical button mapping with the diagnostic command.
+For Panda + Allegro, the two SpaceMouse buttons toggle Allegro gestures on rising edges. PandaGripper uses HID bit 0 to close and bit 1 to open. Jaco requires the corresponding button to remain held for continuous opening or closing; release stops motion immediately. A held Jaco button sweeps the full stroke in about 0.7 s (stock robosuite moves 0.01 per step, about 10 s); --gripper-rate tunes the start ramp. Confirm physical button mapping with the diagnostic command.
 
 In Panda + Allegro integrated mode only, B enlarges the interactive Lift cube once to 1.5x its default size. R restores the default size. This key does not change OSC, dex, or any other entry point.
 
-The Panda + Allegro laser starts at palm_laser_site and points vertically down in world -Z. It is visual only and never changes physics, collision, or actions.
+The Panda + Allegro laser starts at the physical palm centre and follows the palm-side local +Z normal. In the default tabletop pose it points down through the working palm face toward the table. It rotates with the wrist and never changes physics, collision, or actions. The upper-right composite panel is a palm-first-person camera 25 mm outside the working palm face, looking along this same direction. It temporarily hides robot visual geometry and the physical red cylinder only in that panel, so fingers, wrist, and the cylinder cannot obscure the task target; a red centre crosshair marks the same ray's aiming direction.
 
 ## 3.1 Shadow Hand audit
 
-Shadow Hand is a strictly isolated fourth entry point. It is not yet a runnable teleoperation program.
+Shadow Hand is a separate runnable teleoperation entry. It uses the real local MuJoCo Shadow model, a 20-actuator hand slice, and the same SpaceMouse / camera / viewer safety loop. It currently uses rule-style camera curl; Shadow dex-retargeting is not connected.
 
 ~~~powershell
 & $PY .\scripts\run_spacemouse_panda_shadow_hand_teleop.py --audit
 ~~~
 
-The audit writes its report and exits without opening HID, camera, MuJoCo, or a viewer. A regular Shadow Hand startup refuses because robosuite 1.5.2 has no verified native Shadow Hand registration or project-specific mapping. It never runs Allegro instead.
+The audit writes an availability report and exits without opening HID, camera, MuJoCo, or a viewer. Use the regular Shadow command in section 3 for the actual simulation; it never silently substitutes Allegro.
 
 ## 4. Headless automated smoke checks
 
@@ -114,6 +142,64 @@ These commands display the composite viewer briefly, save an initial screenshot,
 ~~~
 
 The interactive Panda + Allegro B key is intentionally outside these synthetic viewer tests.
+
+## 5.1 Official LIBERO Spatial teleoperation
+
+LIBERO uses its own isolated interpreter: Python 3.8, robosuite 1.4, and MuJoCo 3.2.3. Do not run these two files with `.venv-robosuite`, and do not install the LIBERO dependencies into the mainline environment.
+
+~~~powershell
+$LIBERO_PY = ".\.venv-libero\Scripts\python.exe"
+& $LIBERO_PY -m pip install -r .\requirements-libero-teleop.lock
+
+# Panda + Shadow Hand: SpaceMouse controls only the six Panda OSC dimensions;
+# the camera drives Shadow through official dex-retargeting DexPilot by default.
+# The dex sidecar takes ~60 s on first launch. --hand-control legacy-curl keeps
+# the old rule-based mapper.
+& $LIBERO_PY .\scripts\run_libero_spatial_panda_shadow_teleop.py
+
+# Arm speed defaults to 2.5x translation / 1.6x rotation; tune per run:
+& $LIBERO_PY .\scripts\run_libero_spatial_panda_shadow_teleop.py --arm-speed 3.5 --rot-speed 2
+
+# Panda + Robotiq three-finger: hold left to close and right to open.
+& $LIBERO_PY .\scripts\run_libero_spatial_panda_robotiq_three_finger_teleop.py
+
+# Change only the released official Spatial task selection when required.
+& $LIBERO_PY .\scripts\run_libero_spatial_panda_shadow_teleop.py --task-id 1 --init-state-id 0
+~~~
+
+Both adapters load the released `libero_spatial` BDDL and its official default-Panda state. The saved state cannot be copied as one vector after changing the gripper, so the adapter copies only compatible named Panda / object joints and lets the selected hand start in its own safe configuration. This preserves the official scene without falsely claiming that an alternative hand can load the default-gripper state byte-for-byte.
+
+The LIBERO adapter holds its own desired end-effector pose (robosuite 1.4 OSC otherwise re-anchors to the current pose every step and drifts), uses a flange-rigid OSC point for Shadow, rebinds the laser after R (hard reset), and shows the 1920 x 1080 three-view 1:1 with the palm and side views taking the right third of the width. The exit line prints the median loop rate.
+
+Smoke tests use synthetic zero motion and do not prove hardware or task success (--viewer-smoke shows the windows):
+
+~~~powershell
+& $LIBERO_PY .\scripts\run_libero_spatial_panda_shadow_teleop.py --headless --headless-smoke --duration 1 --hand-control off
+& $LIBERO_PY .\scripts\run_libero_spatial_panda_robotiq_three_finger_teleop.py --headless --headless-smoke --duration 1
+& $LIBERO_PY .\scripts\run_libero_spatial_panda_robotiq_three_finger_teleop.py --viewer-smoke
+& $LIBERO_PY -m pytest -q .\tests\test_libero_spatial_teleop.py .\tests\test_shadow_dex.py
+~~~
+
+## 5.2 LIBERO Spatial camera-only teleoperation (Panda + Shadow, no SpaceMouse)
+
+Your RIGHT hand in front of the webcam drives the arm and the Shadow fingers (DexPilot). Show an open right hand, palm toward the camera; the arm starts after about 1.5 s ("arm: tracking"). Then, like a mouse:
+- left/right and up/down: the end effector follows the hand's motion; slow = fine (about 0.5x), fast = farther (up to about 1.8x);
+- depth is a rate control: hold the hand nearer the camera than where it started to move the arm away, farther to bring it back; within +/-3 cm it stays (depth gauge next to the camera preview);
+- turn or tilt the hand: the end effector follows the whole palm rotation (rotation is held while the hand is translating);
+- show your LEFT hand next to the right one = clutch: the arm holds while you reposition the right hand.
+Keys (simulator window): C pause/resume, - / = gain, R reset, Q quit. A lost hand holds the arm. Nothing assists the grasp automatically.
+
+Display: main view + orthographic top (plan) and side (elevation) views aligned with your directions, a vertical palm laser with the height above the surface, and the webcam preview (safe zone + depth gauge) embedded bottom-left.
+
+~~~powershell
+& $LIBERO_PY .\scripts\run_libero_spatial_panda_shadow_camera_teleop.py
+& $LIBERO_PY .\scripts\run_libero_spatial_panda_shadow_camera_teleop.py --gain 0.8 --depth-gain 1.0
+& $LIBERO_PY .\scripts\run_libero_spatial_panda_shadow_camera_teleop.py --viewer-smoke
+& $LIBERO_PY .\scripts\run_libero_spatial_panda_shadow_camera_teleop.py --headless --headless-smoke
+& $LIBERO_PY -m pytest -q .\tests\test_camera_arm_control.py .\tests\test_libero_camera_teleop.py
+~~~
+
+Safety layers (they only slow or stop motion, never move the arm by themselves): workspace = task objects' area + 15 cm within the reach box, reach shell, base-axis radius, yaw +/-90 deg / tilt +/-30 deg; a Jacobian-based guard against joint limits and low manipulability that keeps the Panda elbow bent (joint 4 <= -0.82 rad; the stretched-elbow singularity is at about -0.47 rad); a virtual wall after a block that lifts as soon as you move away or a re-check finds the motion safe; and a hold when a target cannot be reached for 1 s. --camera-fov (default 65) only scales the metric hand estimate.
 
 ## 6. Automated regression and Gate 2
 

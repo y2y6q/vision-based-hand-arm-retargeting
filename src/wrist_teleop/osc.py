@@ -10,6 +10,57 @@ import numpy as np
 from .config import WristConfig
 
 
+# The desired goal may lead the measured end-effector pose by at most this
+# much. Without a bound, pushing into the table or an object keeps adding
+# SpaceMouse increments to an unreachable goal, which later releases as drift.
+GOAL_LEASH_M = 0.05
+GOAL_LEASH_RAD = 0.5
+
+
+class DesiredGoalGuard:
+    """Release latch and leash for robosuite 1.5 ``goal_update_mode='desired'``.
+
+    Desired-goal OSC already holds position at zero input. Two cases still
+    moved the arm with the SpaceMouse released: the goal leading the arm
+    during fast motion (the arm kept travelling to catch up) and a goal wound
+    up against contact. On the release edge the goal is re-latched to the
+    measured pose, and at every step it is clamped near the measured pose.
+    """
+
+    def __init__(self, controller: Any, leash_m: float = GOAL_LEASH_M, leash_rad: float = GOAL_LEASH_RAD):
+        self.controller = controller
+        self.leash_m = float(leash_m)
+        self.leash_rad = float(leash_rad)
+        self._moving = False
+
+    def reset(self) -> None:
+        self._moving = False
+
+    def before_step(self, delta: np.ndarray) -> None:
+        moving = bool(np.any(np.asarray(delta) != 0.0))
+        if self._moving and not moving:
+            self.controller.reset_goal(goal_update_mode="desired")
+        self._moving = moving
+        goal_pos = getattr(self.controller, "goal_pos", None)
+        ref_pos = getattr(self.controller, "ref_pos", None)
+        if goal_pos is not None and ref_pos is not None:
+            error = np.asarray(goal_pos, dtype=np.float64) - np.asarray(ref_pos, dtype=np.float64)
+            distance = float(np.linalg.norm(error))
+            if distance > self.leash_m:
+                self.controller.goal_pos = np.asarray(ref_pos, dtype=np.float64) + error * (self.leash_m / distance)
+        goal_ori = getattr(self.controller, "goal_ori", None)
+        ref_ori = getattr(self.controller, "ref_ori_mat", None)
+        if goal_ori is not None and ref_ori is not None:
+            from robosuite.utils import transform_utils as T
+
+            ref_ori = np.asarray(ref_ori, dtype=np.float64)
+            axis_angle = np.asarray(T.quat2axisangle(T.mat2quat(np.asarray(goal_ori) @ ref_ori.T)), dtype=np.float64)
+            angle = float(np.linalg.norm(axis_angle))
+            if np.isfinite(angle) and angle > self.leash_rad:
+                clamped = axis_angle * (self.leash_rad / angle)
+                self.controller.goal_ori = T.quat2mat(T.axisangle2quat(clamped)) @ ref_ori
+
+
 def create_panda_osc_pose_env(config: WristConfig, *, has_renderer: bool):
     """Create the sole Panda wrist teleoperation environment.
 
@@ -74,10 +125,12 @@ class OscPoseComposer:
         self._low, self._high = (np.asarray(value, dtype=np.float64) for value in env.action_spec)
         if self._low.shape != self._high.shape or self._low.size != env.action_dim:
             raise RuntimeError("robosuite action_spec disagrees with action_dim")
+        self.goal_guard = DesiredGoalGuard(self.controller)
 
     def initialize_goal(self) -> None:
         """Latch current EE pose as desired goal, preventing startup jumps."""
         self.controller.reset_goal(goal_update_mode="desired")
+        self.goal_guard.reset()
 
     def neutral_action(self) -> np.ndarray:
         """Robosuite's verified no-op: zero OSC delta and zero gripper action."""
@@ -109,6 +162,7 @@ class OscPoseComposer:
         if not np.all(output_max > output_min) or not np.all(input_max > input_min):
             raise RuntimeError("OSC_POSE has invalid action scaling limits")
         clipped_delta = np.clip(delta, output_min, output_max)
+        self.goal_guard.before_step(clipped_delta)
         normalized = input_min + (clipped_delta - output_min) * (input_max - input_min) / (output_max - output_min)
         action[self.arm_slice] = np.clip(normalized, self._low[self.arm_slice], self._high[self.arm_slice])
         return action

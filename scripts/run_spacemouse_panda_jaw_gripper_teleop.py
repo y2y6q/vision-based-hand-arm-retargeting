@@ -26,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=ROOT / "configs" / "spacemouse_wrist.json")
     parser.add_argument("--headless", action="store_true", help="run without a MuJoCo viewer")
     parser.add_argument("--duration", type=float, default=None, help="optional bounded run duration in seconds")
+    parser.add_argument("--record", type=Path, default=None, help="optional front-view MP4 path; PNG frames are used if the codec is unavailable")
+    parser.add_argument("--cube-enlarge-factor", type=float, default=1.5, help="B-key Lift cube enlargement factor (> 1)")
     parser.add_argument(
         "--viewer-smoke",
         action="store_true",
@@ -50,6 +52,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--headless-smoke requires --headless")
     if args.viewer_smoke and args.headless_smoke:
         parser.error("choose either --viewer-smoke or --headless-smoke")
+    if args.cube_enlarge_factor <= 1.0:
+        parser.error("--cube-enlarge-factor must be greater than one")
     return args
 
 
@@ -63,6 +67,8 @@ def main() -> int:
         viewer_smoke=args.viewer_smoke,
         headless_smoke=args.headless_smoke,
         enable_three_view=not args.no_three_view,
+        cube_enlarge_factor=args.cube_enlarge_factor,
+        record_path=args.record,
     )
 
 

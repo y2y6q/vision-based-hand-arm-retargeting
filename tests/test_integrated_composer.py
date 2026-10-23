@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import sys
 import unittest
@@ -72,7 +73,8 @@ class IntegratedComposerTests(unittest.TestCase):
         np.testing.assert_allclose(self.composer.held_hand_targets, target)
 
     def test_simulated_spacemouse_and_camera_can_share_one_action(self):
-        mapper = SixDofMapper(self.config)
+        # All six axes at once: opt out of the default dominant-group filter.
+        mapper = SixDofMapper(replace(self.config, motion_coupling="combined"))
         wrist = mapper.map([350, 350, 350, 350, 350, 350])
         target = curls_to_allegro_targets(
             [0.2, 0.4, 0.6, 0.8], self.composer.hand_lower_limits, self.composer.hand_upper_limits

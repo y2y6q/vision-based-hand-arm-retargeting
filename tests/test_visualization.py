@@ -218,6 +218,32 @@ class TriViewCompositorTests(unittest.TestCase):
         self.assertEqual(record["composite_shape"], [92, 80, 3])
         self.assertIsNone(record["key"])
 
+    def test_palm_first_person_panel_gets_a_true_laser_aim_reticle(self):
+        """A co-linear camera uses a reticle instead of a blocked laser tube."""
+
+        sim = _RenderedSim()
+        laser = SimpleNamespace(
+            config=SimpleNamespace(visible_views=("front", "side")),
+            last_update={"active": True, "length_m": 0.4},
+            set_render_view=lambda _view: False,
+            restore_render_visibility=lambda: None,
+        )
+        config = TriViewConfig(
+            front_camera_name="front_cam",
+            wrist_camera_name="wrist_cam",
+            side_camera_name="side_cam",
+            image_width=80,
+            image_height=60,
+            thumbnail_scale=0.5,
+            gutter_px=2,
+            show_window=False,
+        )
+        compositor = TriViewCompositor(config, laser=laser)
+        record = compositor.update(sim)
+        self.assertTrue(record["wrist_laser_aim_overlay"])
+        red = np.array((255, 20, 20), dtype=np.uint8)
+        self.assertTrue(np.any(np.all(compositor.last_frame == red, axis=2)))
+
     def test_composite_routes_key_and_window_close_through_callbacks(self):
         sim = _RenderedSim()
         keys: list[int] = []
@@ -282,6 +308,24 @@ class LaserPointerTests(unittest.TestCase):
         np.testing.assert_array_equal(sim.model.site_size[visual_id], original["size"])
         np.testing.assert_array_equal(sim.model.site_rgba[visual_id], original["rgba"])
         self.assertEqual(int(sim.model.site_sameframe[visual_id]), original["sameframe"])
+
+    def test_wrist_render_can_hide_only_robot_visuals_and_restore_them(self):
+        sim = _laser_sim()
+        pointer = LaserPointer(
+            sim,
+            LaserConfig(
+                local_direction=(0.0, 0.0, -1.0), max_length_m=2.0,
+                hide_robot_in_wrist_view=True,
+            ),
+        )
+        pointer.update()
+        original = {index: sim.model.geom_rgba[index].copy() for index in pointer._excluded_geom_ids}
+        pointer.set_render_view("wrist")
+        self.assertTrue(all(sim.model.geom_rgba[index, 3] == 0.0 for index in original))
+        pointer.set_render_view("side")
+        for index, color in original.items():
+            np.testing.assert_allclose(sim.model.geom_rgba[index], color)
+        pointer.close()
 
     def test_laser_direction_uses_start_site_orientation_and_unavailable_sites_disable_safely(self):
         sim = _laser_sim()
