@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import sys
 import unittest
@@ -12,12 +13,18 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from wrist_teleop.allegro_model import (  # noqa: E402
+    ALLEGRO_GEOMETRY_SCALE,
     ALLEGRO_JOINT_NAMES,
+    ALLEGRO_PALM_CENTER_LOCAL,
+    ALLEGRO_PALMAR_NORMAL_LOCAL,
+    ALLEGRO_PALM_VIEW_CAMERA,
+    ALLEGRO_PALM_VIEW_OFFSET_M,
     AllegroRightHand,
     GRIPPER_TYPE,
     make_allegro_panda_env,
 )
 from wrist_teleop.config import WristConfig  # noqa: E402
+from wrist_teleop.visualization import LaserPointer  # noqa: E402
 
 
 class AllegroModelTests(unittest.TestCase):
@@ -36,6 +43,9 @@ class AllegroModelTests(unittest.TestCase):
         model = hand.get_model()
         self.assertEqual(model.njnt, 16)
         self.assertEqual(model.nu, 16)
+        self.assertAlmostEqual(hand.describe()["geometry_scale"], ALLEGRO_GEOMETRY_SCALE)
+        root_id = model.body(hand.naming_prefix + "allegro_right_hand").id
+        self.assertAlmostEqual(float(model.body_pos[root_id, 2]), 0.095 * ALLEGRO_GEOMETRY_SCALE)
         self.assertTrue(np.all(model.geom_contype[np.asarray([model.geom(name).id for name in hand.contact_geoms])] == 1))
         np.testing.assert_allclose(model.actuator_ctrlrange[:, 0], hand.lower_limits)
         np.testing.assert_allclose(model.actuator_ctrlrange[:, 1], hand.upper_limits)
@@ -70,12 +80,56 @@ class AllegroPandaIntegrationTests(unittest.TestCase):
         self.assertNotIn("PandaGripper", type(self.hand).__name__)
         self.assertGreaterEqual(self.env.sim.model.site_name2id(self.hand.important_sites["grip_site"]), 0)
 
-    def test_transparent_palm_laser_site_marks_the_source_palm_frame(self):
+    def test_transparent_palm_laser_site_marks_the_physical_palm_centre(self):
         site_id = self.env.sim.model.site_name2id("gripper0_right_palm_laser_site")
-        palm_body_id = self.env.sim.model.body_name2id("gripper0_right_palm")
+        base_body_id = self.env.sim.model.body_name2id("gripper0_right_allegro_right_hand")
         self.assertGreaterEqual(site_id, 0)
-        self.assertEqual(int(self.env.sim.model.site_bodyid[site_id]), palm_body_id)
+        self.assertEqual(int(self.env.sim.model.site_bodyid[site_id]), base_body_id)
+        np.testing.assert_allclose(self.env.sim.model.site_pos[site_id], ALLEGRO_PALM_CENTER_LOCAL)
         np.testing.assert_allclose(self.env.sim.model.site_rgba[site_id], [1.0, 0.0, 0.0, 0.0])
+
+    def test_palm_laser_uses_the_working_palm_normal_and_hits_the_table(self):
+        laser_config = replace(
+            WristConfig().laser,
+            start_site="palm_laser_site",
+            direction_frame="site",
+            local_direction=ALLEGRO_PALMAR_NORMAL_LOCAL,
+        )
+        pointer = LaserPointer(self.env, laser_config)
+        self.addCleanup(pointer.close)
+        record = pointer.update()
+        site_id = self.env.sim.model.site_name2id("gripper0_right_palm_laser_site")
+        world_from_palm = self.env.sim.data.site_xmat[site_id].reshape(3, 3)
+        expected_normal = world_from_palm @ np.asarray(ALLEGRO_PALMAR_NORMAL_LOCAL)
+        np.testing.assert_allclose(record["direction_world"], expected_normal, atol=1.0e-12)
+        # The initial Lift cube is randomized and may sit directly under the
+        # palm ray. Either result confirms the first non-robot scene hit;
+        # asserting the table alone made this visual-only test seed-sensitive.
+        self.assertIn(record["hit_geom"], {"table_collision", "cube_g0"})
+        self.assertLess(float(record["direction_world"][2]), -0.9)
+
+    def test_palm_view_camera_looks_along_the_laser_not_at_the_hand_back(self):
+        camera_id = self.env.sim.model.camera_name2id("gripper0_right_" + ALLEGRO_PALM_VIEW_CAMERA)
+        site_id = self.env.sim.model.site_name2id("gripper0_right_palm_laser_site")
+        self.assertGreaterEqual(camera_id, 0)
+        world_from_palm = self.env.sim.data.site_xmat[site_id].reshape(3, 3)
+        expected_forward = world_from_palm @ np.asarray(ALLEGRO_PALMAR_NORMAL_LOCAL)
+        world_from_camera = self.env.sim.data.cam_xmat[camera_id].reshape(3, 3)
+        # MuJoCo's positive camera Z is its backward axis.
+        np.testing.assert_allclose(-world_from_camera[:, 2], expected_forward, atol=1.0e-12)
+        expected_position = np.asarray(ALLEGRO_PALM_CENTER_LOCAL) + (
+            np.asarray(ALLEGRO_PALMAR_NORMAL_LOCAL) * ALLEGRO_PALM_VIEW_OFFSET_M
+        )
+        np.testing.assert_allclose(self.env.sim.model.cam_pos[camera_id], expected_position, atol=1.0e-12)
+        # The camera origin is only a small clearance in front of the
+        # physical palm and remains exactly on the laser centreline.
+        expected_world_offset = expected_forward * ALLEGRO_PALM_VIEW_OFFSET_M
+        np.testing.assert_allclose(
+            self.env.sim.data.cam_xpos[camera_id] - self.env.sim.data.site_xpos[site_id],
+            expected_world_offset,
+            atol=1.0e-12,
+        )
+        self.assertAlmostEqual(float(self.env.sim.model.cam_fovy[camera_id]), 70.0)
 
     def test_normalized_hand_slice_drives_exact_position_actuator_targets(self):
         targets = self.hand.init_qpos.copy()

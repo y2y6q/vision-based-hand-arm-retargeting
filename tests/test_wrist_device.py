@@ -96,6 +96,7 @@ class SpaceMouseHidTests(unittest.TestCase):
         reader, _ = self.make_reader([packet(1, 1, 0, 0, 0, 0, 0)])
         self.assertTrue(reader.poll().valid)
         reader._last_motion_at -= reader.config.stale_timeout_s + 0.01
+        reader._last_translation_at -= reader.config.stale_timeout_s + 0.01
         self.assertFalse(reader.poll().valid)
         bad_reader, fake = self.make_reader(read_error=OSError("removed"))
         sample = bad_reader.poll()
@@ -103,6 +104,35 @@ class SpaceMouseHidTests(unittest.TestCase):
         np.testing.assert_array_equal(sample.raw_axes, np.zeros(6))
         self.assertIn("HID read failed", sample.error)
         self.assertTrue(fake.closed)
+
+    def test_fresh_translation_cannot_replay_a_stale_rotation_packet(self):
+        """Split HID reports expire independently so a held yaw cannot twitch."""
+
+        settings = WristConfig(
+            raw_ranges=(100.0,) * 6,
+            translation_deadzone=0.05,
+            rotation_deadzone=0.05,
+            translation_release_deadzone=0.05,
+            rotation_release_deadzone=0.05,
+            zero_bias_calibration_frames=1,
+            neutral_startup_s=1e-9,
+        )
+        fake = FakeDevice([packet(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)])
+        reader = SpaceMouseHid(settings, hid_module=FakeHid(fake))
+        reader.open()
+        reader._opened_at -= 0.01
+        self.assertTrue(reader.poll().armed)
+
+        # A historical rotation packet is still visible in raw telemetry, but
+        # only a later translation packet arrives. Its stale rotation axes
+        # must be exact control zeros.
+        reader._raw_axes[3:] = [0.0, 0.0, 90.0]
+        reader._last_rotation_at -= settings.stale_timeout_s + 0.01
+        fake.reports.append(packet(1, 20, 0, 0, 0, 0, 0))
+        sample = reader.poll()
+        self.assertTrue(sample.valid)
+        self.assertGreater(sample.control_axes[0], 0.0)
+        np.testing.assert_array_equal(sample.control_axes[3:], np.zeros(3))
 
     def test_buttons_never_enter_motion_vector(self):
         reader, _ = self.make_reader([packet(3, 0b11111111)])
@@ -123,6 +153,30 @@ class SpaceMouseHidTests(unittest.TestCase):
         np.testing.assert_array_equal(reset.raw_axes, np.zeros(6))
         self.assertEqual(reset.buttons, (False,) * 8)
         self.assertFalse(reset.buttons_valid)
+
+    def test_pressed_button_has_bounded_hold_window_then_fails_closed(self):
+        """Drivers without repeated hold packets still get one full stroke."""
+
+        settings = WristConfig(neutral_startup_s=1e-9, stale_timeout_s=0.25, button_hold_timeout_s=1.0)
+        fake = FakeDevice([packet(3, 0b00000001)])
+        reader = SpaceMouseHid(settings, hid_module=FakeHid(fake))
+        reader.open()
+        pressed = reader.poll()
+        self.assertTrue(pressed.buttons_valid)
+        self.assertTrue(pressed.buttons[0])
+
+        # Motion can go stale while the wrist is stationary; the pressed
+        # state remains valid only through its separate bounded dead-man
+        # window.
+        reader._last_button_at -= 0.50
+        held = reader.poll()
+        self.assertTrue(held.buttons_valid)
+        self.assertTrue(held.buttons[0])
+        self.assertFalse(held.valid)
+
+        reader._last_button_at -= settings.button_hold_timeout_s
+        expired = reader.poll()
+        self.assertFalse(expired.buttons_valid)
 
     def test_startup_zero_bias_requires_centered_reports_and_is_not_learned_while_moving(self):
         settings = WristConfig(

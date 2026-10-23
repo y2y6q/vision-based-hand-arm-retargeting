@@ -24,6 +24,24 @@ reads its Panda-Allegro URDF assets but does not modify the baseline code.
 The official wheel runs only inside the isolated dex sidecar. The robosuite /
 MuJoCo process does not import its native dependencies.
 
+## dex-urdf Shadow Hand (kinematics for the dex-retargeting sidecar)
+
+- Source: dex-urdf Shadow Hand as distributed with dexsuite/dex-retargeting
+- License: Apache-2.0
+- Local path and provenance: [`third_party/dex_urdf/PROVENANCE.md`](third_party/dex_urdf/PROVENANCE.md)
+- License copy: [`third_party/dex_urdf/shadow_hand/LICENSE`](third_party/dex_urdf/shadow_hand/LICENSE)
+
+Only the URDF is included (meshes omitted); it is used for kinematics in the
+isolated dex sidecar.
+
+## LIBERO
+
+- Source: <https://github.com/Lifelong-Robot-Learning/LIBERO>, commit `8f1084e`
+- License: MIT
+
+LIBERO is installed from a local clone in `third_party/LIBERO` inside the
+isolated `.venv-libero`; it is not redistributed in this repository.
+
 ## Shadow Hand assets
 
 The locally audited Shadow Hand assets retain their source license at

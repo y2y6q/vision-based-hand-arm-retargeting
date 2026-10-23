@@ -93,12 +93,12 @@ class GraspValidationConfig:
     is a wrist reference, while the generated Allegro root is the palm frame.
     """
 
-    config_version: str = "grasp-gates-v9-substep-fixture-normal-search"
+    config_version: str = "grasp-gates-v10-allegro-2of3-thumb-first"
     change_note: str = (
-        "v9 replaces the 20 Hz zero-order-held temporary support with a critically "
-        "damped force fixture updated on every MuJoCo substep, removes the release "
-        "velocity write, records canonical cube-to-hand normals, and runs the "
-        "fixed Gate 2 staged geometry search before qualification."
+        "v10 re-derives the Gate 2 cube placement, close curls, and search grids "
+        "for the 2/3-scale runtime Allegro (ALLEGRO_GEOMETRY_SCALE) and closes the "
+        "thumb under the unscaled cube before index/middle press it; the v9 "
+        "substep fixture, normal-opposition test, and 1/3/10 policy are unchanged."
     )
     seed: int = 20260909
     control_hz: float = 20.0
@@ -120,9 +120,18 @@ class GraspValidationConfig:
     # Gate 2: a physically held, temporary placement fixture is released
     # before the three-second gravity-on evaluation.  It is never a weld and
     # it never follows the wrist after release.
-    static_cube_center_tcp_m: tuple[float, float, float] = (0.085, 0.030, 0.115)
-    static_close_curls: tuple[float, float, float, float] = (0.50, 0.50, 0.50, 0.85)
+    # Placement and curls are for the 2/3-scale runtime hand holding the
+    # unscaled Lift cube: the thumb pad sits under the cube's proximal (-Z)
+    # face and index/middle press its distal (+Z) face.  The v9 values
+    # (0.085, 0.030, 0.115) / (0.50, 0.50, 0.50, 0.85) assumed the full-size
+    # hand and put the cube outside the scaled thumb--finger envelope.
+    static_cube_center_tcp_m: tuple[float, float, float] = (0.046, 0.017, 0.088)
+    static_close_curls: tuple[float, float, float, float] = (0.45, 0.45, 0.45, 0.90)
     close_duration_s: float = 1.20
+    # The thumb closes alone for this part of close_duration_s so it passes
+    # under the cube before the fingers load it; closing all digits together
+    # lets the scaled thumb sweep into the cube's side face instead.
+    static_thumb_lead_s: float = 0.60
     temporary_support_preclose_s: float = 0.30
     temporary_support_settle_s: float = 3.80
     temporary_support_release_ramp_s: float = 0.30
@@ -142,9 +151,9 @@ class GraspValidationConfig:
     normal_contact_min_force_n: float = 0.05
     static_hold_s: float = 3.10
     static_slip_limit_m: float = 0.025
-    gate2_y_candidates_m: tuple[float, float, float] = (0.010, 0.015, 0.020)
-    gate2_x_candidates_m: tuple[float, float, float] = (0.080, 0.085, 0.090)
-    gate2_z_candidates_m: tuple[float, float, float] = (0.110, 0.115, 0.120)
+    gate2_y_candidates_m: tuple[float, float, float] = (0.013, 0.017, 0.021)
+    gate2_x_candidates_m: tuple[float, float, float] = (0.042, 0.046, 0.050)
+    gate2_z_candidates_m: tuple[float, float, float] = (0.086, 0.088, 0.090)
     gate2_search_top_geometry_candidates: int = 2
     # Gate 3
     table_cube_xy_m: tuple[float, float] = (-0.050, 0.000)
@@ -173,7 +182,7 @@ class GraspValidationConfig:
             "control_hz", "open_settle_s", "probe_settle_s", "joint_target_error_rad",
             "joint_motion_fraction_required", "actuator_saturation_fraction",
             "sustained_saturation_s", "joint_limit_margin_rad", "significant_penetration_m",
-            "close_duration_s", "temporary_support_preclose_s", "temporary_support_settle_s", "temporary_support_release_ramp_s",
+            "close_duration_s", "static_thumb_lead_s", "temporary_support_preclose_s", "temporary_support_settle_s", "temporary_support_release_ramp_s",
             "temporary_support_natural_frequency_hz", "temporary_support_damping_ratio",
             "temporary_support_max_correction_accel_mps2", "fixture_peak_speed_limit_mps",
             "gravity_release_settle_s", "normal_contact_min_force_n",
@@ -184,6 +193,8 @@ class GraspValidationConfig:
         ):
             if not np.isfinite(float(getattr(self, name))) or float(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        if float(self.static_thumb_lead_s) >= float(self.close_duration_s):
+            raise ValueError("static_thumb_lead_s must be shorter than close_duration_s")
         if not 0.0 < float(self.joint_motion_fraction_required) <= 1.0:
             raise ValueError("joint_motion_fraction_required must be in (0, 1]")
         if not 0.0 < float(self.actuator_saturation_fraction) <= 1.0:
@@ -277,6 +288,11 @@ TUNING_HISTORY: tuple[Mapping[str, Any], ...] = (
         "change": "replace the 20 Hz held virtual fixture with mass-derived, critically damped per-physics-substep support; remove release qvel reset; add canonical-normal Gate 2 screening",
         "reason": "v8 showed a 2.521 m/s fixture transient and 9.843 mm index-tip impact during close/settle, while initial placement and gravity hold were stable",
     },
+    {
+        "version": "v10",
+        "change": "cube offset [0.085, 0.030, 0.115] -> [0.046, 0.017, 0.088]; curls [0.50, 0.50, 0.50, 0.85] -> [0.45, 0.45, 0.45, 0.90]; thumb closes alone for 0.60 s before the fingers; search grids re-centred (x 42-50, y 13-21, z 86-90 mm); stage-3 variants thumb-first",
+        "reason": "the 2026-10-19 runtime Allegro scale of 2/3 left the v9 full-size placement outside the hand (fixture smoke: 0.888 m/s object_ejected); forcing scale 1.0 restored the 2026-09-17 metrics exactly, and a simultaneous close on the scaled hand put the thumb on a side face (opposition dot ~0)",
+    },
 )
 
 
@@ -284,7 +300,7 @@ TUNING_HISTORY: tuple[Mapping[str, Any], ...] = (
 class Gate2Candidate:
     """A fully recorded static grasp candidate used only inside Gate 2.
 
-    The first two search stages intentionally retain the v8 hand target and
+    The first two search stages intentionally retain the static hand target and
     vary only the requested cube TCP coordinates.  The final stage may use a
     short, explicit finger schedule after geometry has been ranked.
     """
@@ -1903,8 +1919,20 @@ class GraspValidationRunner:
             stage="fixture_smoke",
             cube_center_tcp_m=self.config.static_cube_center_tcp_m,
             final_curls=self.config.static_close_curls,
-            close_schedule=((self.config.close_duration_s, self.config.static_close_curls),),
-            rationale="v8 static pose and curl target used only to validate the repaired fixture before geometry screening",
+            close_schedule=self._static_close_schedule(self.config.static_close_curls),
+            rationale="static pose and curl target used only to validate the repaired fixture before geometry screening",
+        )
+
+    def _static_close_schedule(
+        self, final_curls: Sequence[float],
+    ) -> tuple[tuple[float, tuple[float, float, float, float]], ...]:
+        """Thumb-first close: the thumb reaches its final curl, then the fingers follow."""
+
+        curls = tuple(float(value) for value in final_curls)
+        lead = float(self.config.static_thumb_lead_s)
+        return (
+            (lead, (0.0, 0.0, 0.0, curls[3])),
+            (float(self.config.close_duration_s) - lead, curls),
         )
 
     def _candidate_sha256(self, candidate: Gate2Candidate) -> str:
@@ -2506,8 +2534,8 @@ class GraspValidationRunner:
                 stage="geometry_y",
                 cube_center_tcp_m=(x, y, z),
                 final_curls=self.config.static_close_curls,
-                close_schedule=((self.config.close_duration_s, self.config.static_close_curls),),
-                rationale="stage 1: vary only cube TCP local Y; preserve v8 X, Z, orientation, and final curls",
+                close_schedule=self._static_close_schedule(self.config.static_close_curls),
+                rationale="stage 1: vary only cube TCP local Y; preserve static X, Z, orientation, and final curls",
             )
             for y in self.config.gate2_y_candidates_m
         ]
@@ -2522,8 +2550,8 @@ class GraspValidationRunner:
                 stage="geometry_xz",
                 cube_center_tcp_m=(x, y, z),
                 final_curls=self.config.static_close_curls,
-                close_schedule=((self.config.close_duration_s, self.config.static_close_curls),),
-                rationale="stage 2: vary only cube TCP local X/Z after selecting the stage-1 Y; preserve v8 curls",
+                close_schedule=self._static_close_schedule(self.config.static_close_curls),
+                rationale="stage 2: vary only cube TCP local X/Z after selecting the stage-1 Y; preserve static curls",
             )
             for x in self.config.gate2_x_candidates_m
             for z in self.config.gate2_z_candidates_m
@@ -2531,8 +2559,8 @@ class GraspValidationRunner:
 
     def _finger_schedule_candidates(self, geometry_candidates: Sequence[Gate2Candidate]) -> list[Gate2Candidate]:
         variants = (
-            ("c1", (0.50, 0.50, 0.15, 0.85)),
-            ("c2", (0.50, 0.50, 0.15, 0.80)),
+            ("c1", (0.45, 0.45, 0.15, 0.90)),
+            ("c2", (0.45, 0.45, 0.15, 0.85)),
         )
         candidates: list[Gate2Candidate] = []
         for geometry in geometry_candidates:
@@ -2542,12 +2570,8 @@ class GraspValidationRunner:
                     stage="finger_schedule",
                     cube_center_tcp_m=geometry.cube_center_tcp_m,
                     final_curls=final_curls,
-                    close_schedule=(
-                        (0.35, (0.35, 0.35, 0.10, 0.30)),
-                        (0.35, (0.50, 0.50, 0.15, 0.55)),
-                        (0.50, final_curls),
-                    ),
-                    rationale="stage 3: index/middle approach first, thumb closes second, ring remains backed away",
+                    close_schedule=self._static_close_schedule(final_curls),
+                    rationale="stage 3: thumb closes under the cube first, index/middle press second, ring remains backed away",
                 ))
         return candidates
 

@@ -14,7 +14,13 @@ from wrist_teleop.hand_gestures import (
 )
 from wrist_teleop.shadow_gripper import (
     GRIPPER_TYPE,
+    PANDA_FLANGE_BODY,
     SHADOW_ACTUATOR_NAMES,
+    SHADOW_PALMAR_NORMAL_LOCAL,
+    SHADOW_PALM_CENTER_LOCAL,
+    SHADOW_PALM_VIEW_CAMERA,
+    SHADOW_PALM_VIEW_OFFSET_M,
+    SHADOW_DIRECT_MOUNT_BODY,
     SHADOW_JOINT_NAMES,
     ShadowHandRight,
     make_shadow_panda_env,
@@ -23,6 +29,7 @@ from wrist_teleop.shadow_hand_input import (
     ShadowHandGestureController,
     ShadowLegacyHandInput,
     curls_to_shadow_targets,
+    estimate_thumb_pinch_strengths,
 )
 from wrist_teleop.shadow_integrated import PandaShadowActionComposer
 
@@ -39,6 +46,51 @@ def test_shadow_gripper_contract_and_normalized_round_trip():
     assert set(hand.important_sites) >= {"grip_site", "grip_cylinder", "ee", "ee_x", "ee_y", "ee_z"}
 
 
+def test_shadow_direct_mount_removes_forearm_and_palm_camera_faces_working_surface():
+    env = make_shadow_panda_env(WristConfig(), has_renderer=False)
+    try:
+        env.reset()
+        model, data = env.sim.model, env.sim.data
+        body_names = {model.body_id2name(index) for index in range(model.nbody)}
+        assert "gripper0_right_rh_forearm" not in body_names
+
+        # The hand is directly attached to Panda link7.  Its palm collision
+        # meshes must therefore never repel that fixed mounting surface; all
+        # other hand-to-scene collisions remain enabled.
+        palm_body = "gripper0_right_" + SHADOW_DIRECT_MOUNT_BODY
+        excluded_pair = {model.body_name2id(PANDA_FLANGE_BODY), model.body_name2id(palm_body)}
+        for contact_index in range(data.ncon):
+            contact = data.contact[contact_index]
+            geom_pair = {
+                int(model.geom_bodyid[contact.geom1]),
+                int(model.geom_bodyid[contact.geom2]),
+            }
+            assert geom_pair != excluded_pair
+
+        camera_id = model.camera_name2id("gripper0_right_" + SHADOW_PALM_VIEW_CAMERA)
+        site_id = model.site_name2id("gripper0_right_palm_laser_site")
+        assert camera_id >= 0
+        assert site_id >= 0
+        np.testing.assert_allclose(
+            model.cam_pos[camera_id],
+            np.asarray(SHADOW_PALM_CENTER_LOCAL)
+            + np.asarray(SHADOW_PALMAR_NORMAL_LOCAL) * SHADOW_PALM_VIEW_OFFSET_M,
+            atol=1.0e-12,
+        )
+        assert float(model.cam_fovy[camera_id]) == 82.0
+        world_from_palm = data.site_xmat[site_id].reshape(3, 3)
+        world_from_camera = data.cam_xmat[camera_id].reshape(3, 3)
+        np.testing.assert_allclose(
+            -world_from_camera[:, 2],
+            world_from_palm @ np.asarray(SHADOW_PALMAR_NORMAL_LOCAL),
+            atol=1.0e-12,
+        )
+    finally:
+        env.close()
+        from robosuite.models.grippers import GRIPPER_MAPPING
+        GRIPPER_MAPPING.pop(GRIPPER_TYPE, None)
+
+
 def test_shadow_legacy_curl_is_bounded_and_keeps_wrist_neutral():
     hand = ShadowHandRight(idn="unit")
     targets = curls_to_shadow_targets([1.0, 0.5, 0.25, 0.75], hand.lower_limits, hand.upper_limits)
@@ -50,6 +102,146 @@ def test_shadow_legacy_curl_is_bounded_and_keeps_wrist_neutral():
     reset = source.reset(timestamp_s=2.0)
     assert reset.joint_targets.shape == (20,)
     assert not reset.valid
+
+
+def test_shadow_thumb_tip_pinch_adds_opposition_when_thumb_curl_is_small():
+    """A visual fingertip pinch must not depend on a large thumb bend angle."""
+
+    hand = ShadowHandRight(idn="unit")
+    curls = [0.85, 0.70, 0.0, 0.0]
+    ordinary = curls_to_shadow_targets(curls, hand.lower_limits, hand.upper_limits)
+    index_pinch = curls_to_shadow_targets(
+        curls, hand.lower_limits, hand.upper_limits,
+        thumb_pinch_strengths=[1.0, 0.0, 0.0, 0.0],
+    )
+    middle_pinch = curls_to_shadow_targets(
+        curls, hand.lower_limits, hand.upper_limits,
+        thumb_pinch_strengths=[0.0, 1.0, 0.0, 0.0],
+    )
+    assert np.all(index_pinch >= hand.lower_limits)
+    assert np.all(index_pinch <= hand.upper_limits)
+    assert np.all(middle_pinch >= hand.lower_limits)
+    assert np.all(middle_pinch <= hand.upper_limits)
+    # Thumb targets change without changing any of the other 15 actuators.
+    np.testing.assert_allclose(index_pinch[:2], ordinary[:2])
+    np.testing.assert_allclose(index_pinch[7:], ordinary[7:])
+    assert np.any(np.abs(index_pinch[2:7] - ordinary[2:7]) > 1e-8)
+    tip_only_index = curls_to_shadow_targets(
+        [0.0, 0.0, 0.0, 0.0], hand.lower_limits, hand.upper_limits,
+        thumb_pinch_strengths=[1.0, 0.0, 0.0, 0.0],
+    )
+    assert np.any(tip_only_index[7:10] > 0.0)
+    # The middle/ring profile uses both a cross-palm base component and the
+    # required negative THJ2 direction, which the old all-positive rule could
+    # never command.
+    assert middle_pinch[4] > ordinary[4]
+    assert middle_pinch[5] < ordinary[5]
+
+
+def test_shadow_thumb_pinch_estimator_uses_tip_distance_not_thumb_curl_only():
+    """Tip contact is scale-normalized by the index--little MCP span."""
+
+    points = [np.zeros(3, dtype=np.float64) for _ in range(21)]
+    points[5] = np.array([-0.5, 0.0, 0.0])
+    points[17] = np.array([0.5, 0.0, 0.0])
+    points[4] = np.array([0.0, 0.0, 0.0])  # thumb tip
+    points[8] = np.array([0.02, 0.0, 0.0])  # index tip touches thumb
+    points[12] = np.array([1.20, 0.0, 0.0])
+    points[16] = np.array([1.20, 0.0, 0.0])
+    points[20] = np.array([1.20, 0.0, 0.0])
+    strengths = estimate_thumb_pinch_strengths(points)
+    assert strengths.shape == (4,)
+    assert strengths[0] > 0.9
+    assert np.all(strengths[1:] == 0.0)
+
+
+def test_shadow_tip_pinch_targets_reduce_real_model_tip_separation():
+    """Regression: a camera pinch cue must move the simulated thumb inward."""
+
+    env = make_shadow_panda_env(WristConfig(), has_renderer=False)
+    try:
+        def settle(pinch_strengths):
+            env.reset()
+            composer = PandaShadowActionComposer(env)
+            model = env.sim.model
+            tips = {}
+            for name, body_name in {
+                "thumb": "rh_thdistal", "index": "rh_ffdistal", "middle": "rh_mfdistal",
+            }.items():
+                body_id = model.body_name2id("gripper0_right_" + body_name)
+                tips[name] = next(
+                    index for index in range(model.ngeom)
+                    if model.geom_bodyid[index] == body_id and model.geom_group[index] == 0
+                )
+            targets = curls_to_shadow_targets(
+                # Reproduce the reported failure mode: MediaPipe sees two
+                # fingertips together while ordinary per-finger curl is low.
+                [0.0, 0.0, 0.0, 0.0],
+                composer.hand_lower_limits,
+                composer.hand_upper_limits,
+                thumb_pinch_strengths=pinch_strengths,
+            )
+            action = composer.compose(np.zeros(6), targets)
+            for _ in range(120):
+                env.step(action)
+            data = env.sim.data
+            positions = {name: data.geom_xpos[index].copy() for name, index in tips.items()}
+            return (
+                float(np.linalg.norm(positions["thumb"] - positions["index"])),
+                float(np.linalg.norm(positions["thumb"] - positions["middle"])),
+                action,
+                composer,
+            )
+
+        open_index, open_middle, _open_action, _open_composer = settle([0.0, 0.0, 0.0, 0.0])
+        index_distance, _unused_middle, index_action, index_composer = settle([1.0, 0.0, 0.0, 0.0])
+        _unused_index, middle_distance, middle_action, middle_composer = settle([0.0, 1.0, 0.0, 0.0])
+        tripod_index, tripod_middle, tripod_action, tripod_composer = settle([1.0, 1.0, 0.0, 0.0])
+
+        assert index_distance < open_index - 0.03
+        assert middle_distance < open_middle - 0.03
+        # A thumb--index--middle cue must close both opposing fingers. Before
+        # the contact-set fix it selected only index via argmax(), leaving the
+        # simulated thumb--middle separation near 110 mm.
+        assert tripod_index < open_index - 0.06
+        assert tripod_middle < open_middle - 0.07
+        assert np.allclose(index_action[index_composer.arm_slice], 0.0)
+        assert np.allclose(middle_action[middle_composer.arm_slice], 0.0)
+        assert np.allclose(tripod_action[tripod_composer.arm_slice], 0.0)
+    finally:
+        env.close()
+        from robosuite.models.grippers import GRIPPER_MAPPING
+        GRIPPER_MAPPING.pop(GRIPPER_TYPE, None)
+
+
+def test_shadow_pinch_contact_set_closes_every_confirmed_partner():
+    """Two simultaneous fingertip contacts must not discard the second finger."""
+
+    hand = ShadowHandRight(idn="unit")
+    open_target = curls_to_shadow_targets(
+        [0.0, 0.0, 0.0, 0.0], hand.lower_limits, hand.upper_limits
+    )
+    tripod = curls_to_shadow_targets(
+        [0.0, 0.0, 0.0, 0.0],
+        hand.lower_limits,
+        hand.upper_limits,
+        thumb_pinch_strengths=[1.0, 1.0, 0.0, 0.0],
+    )
+    # Index and middle actuator triples are both engaged. Ring/little remain
+    # untouched for this three-digit thumb--index--middle pinch.
+    assert np.any(tripod[7:10] > open_target[7:10])
+    assert np.any(tripod[10:13] > open_target[10:13])
+    np.testing.assert_allclose(tripod[13:20], open_target[13:20])
+
+    # Incidental near-proximity below the contact threshold must not make an
+    # open neighboring finger join the pinch.
+    weak_neighbor = curls_to_shadow_targets(
+        [0.0, 0.0, 0.0, 0.0],
+        hand.lower_limits,
+        hand.upper_limits,
+        thumb_pinch_strengths=[1.0, 0.24, 0.0, 0.0],
+    )
+    np.testing.assert_allclose(weak_neighbor[10:13], open_target[10:13])
 
 
 def test_shadow_button_gestures_toggle_on_edges_and_keep_targets_bounded():
@@ -176,5 +368,35 @@ def test_shadow_environment_reset_step_and_slice_isolation():
         # registration across hard resets.  Restore the installed-factory
         # baseline after this integration test so the independent audit tests
         # can still assert their pre-adapter boundary.
+        from robosuite.models.grippers import GRIPPER_MAPPING
+        GRIPPER_MAPPING.pop(GRIPPER_TYPE, None)
+
+
+def test_shadow_neutral_command_stays_stable_after_safe_open_settle():
+    """A direct-mounted Shadow hand must not create ongoing arm drift at rest."""
+
+    env = make_shadow_panda_env(WristConfig(), has_renderer=False)
+    try:
+        env.reset()
+        composer = PandaShadowActionComposer(env)
+        gestures = ShadowHandGestureController(
+            HandGestureConfig(),
+            lower_limits=composer.hand_lower_limits,
+            upper_limits=composer.hand_upper_limits,
+        )
+        hand = gestures.reset(buttons=(False,) * 8)
+        action = composer.compose(np.zeros(6), hand.joint_targets)
+        for _ in range(15):
+            env.step(action)
+        composer.initialize_goal()
+        action = composer.compose(np.zeros(6), hand.joint_targets)
+        body_id = env.sim.model.body_name2id("robot0_right_hand")
+        start = env.sim.data.body_xpos[body_id].copy()
+        for _ in range(200):
+            env.step(action)
+        end = env.sim.data.body_xpos[body_id].copy()
+        assert np.linalg.norm(end - start) < 1.0e-3
+    finally:
+        env.close()
         from robosuite.models.grippers import GRIPPER_MAPPING
         GRIPPER_MAPPING.pop(GRIPPER_TYPE, None)

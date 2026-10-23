@@ -25,9 +25,10 @@ class MotionSample:
     ``raw_axes`` is ``[report_tx, report_ty, report_tz, roll, pitch, yaw]``.
     The mapper owns all axis reordering, signs, scale, and frame conversion.
     ``valid`` applies only to motion and becomes false after stale motion or a
-    HID failure. ``buttons_valid`` tracks the independent button packet
-    freshness, so a stationary wrist can still receive a button rising edge
-    without replaying an old motion vector.
+    HID failure. ``buttons_valid`` tracks the independent button state. An
+    observed pressed state is retained for the bounded
+    ``button_hold_timeout_s`` window because some Windows HID drivers emit a
+    button report only on press and release, not continuously while held.
     """
 
     raw_axes: np.ndarray
@@ -76,6 +77,12 @@ class SpaceMouseHid:
         self._buttons = (False,) * 8
         self._opened_at: float | None = None
         self._last_motion_at: float | None = None
+        # Wireless SpaceMouse devices normally send translation (report 1)
+        # and rotation (report 2) separately.  These timestamps must remain
+        # independent: a fresh translation packet must never keep an old
+        # rotational value alive, or the arm can appear to twitch at rest.
+        self._last_translation_at: float | None = None
+        self._last_rotation_at: float | None = None
         self._last_button_at: float | None = None
         self._armed = False
         self._error: str | None = None
@@ -129,6 +136,8 @@ class SpaceMouseHid:
         self._buttons = (False,) * 8
         self._opened_at = time.monotonic() if self._device is not None else None
         self._last_motion_at = None
+        self._last_translation_at = None
+        self._last_rotation_at = None
         self._last_button_at = None
         self._armed = False
         self._error = None
@@ -191,16 +200,19 @@ class SpaceMouseHid:
         report_id = int(values[0])
         if report_id == 1:
             self._raw_axes[:3] = self._three_axes(values)
+            self._last_translation_at = now
             if len(values) >= 13:
                 self._raw_axes[3:] = np.array([
                     self._int16(values[7], values[8]),
                     self._int16(values[9], values[10]),
                     self._int16(values[11], values[12]),
                 ], dtype=np.float64)
+                self._last_rotation_at = now
             self._last_motion_at = now
             self._observe_startup_neutral()
         elif report_id == 2:
             self._raw_axes[3:] = self._three_axes(values)
+            self._last_rotation_at = now
             self._last_motion_at = now
             self._observe_startup_neutral()
         elif report_id == 3 and len(values) >= 2:
@@ -237,9 +249,38 @@ class SpaceMouseHid:
                 and self._zero_bias_locked
                 and np.all(np.abs(calibrated) <= neutral_limit)):
             self._armed = True
-        valid = self._last_motion_at is not None and now - self._last_motion_at <= self.config.stale_timeout_s
-        buttons_valid = self._last_button_at is not None and now - self._last_button_at <= self.config.stale_timeout_s
+        translation_fresh = (
+            self._last_translation_at is not None
+            and now - self._last_translation_at <= self.config.stale_timeout_s
+        )
+        rotation_fresh = (
+            self._last_rotation_at is not None
+            and now - self._last_rotation_at <= self.config.stale_timeout_s
+        )
+        # Full six-axis reports set both timestamps. Split-report devices can
+        # safely use the group that was actually refreshed, while a stale
+        # group is set to an exact zero command below.
+        valid = bool(translation_fresh or rotation_fresh)
+        button_age_s = (
+            float("inf") if self._last_button_at is None else max(now - self._last_button_at, 0.0)
+        )
+        # A false button state cannot command a gripper, so it keeps the
+        # usual short freshness rule. A true state gets a narrowly bounded
+        # dead-man interval: release packets stop immediately; no release or
+        # repeat packet after this interval fails closed. This supports the
+        # SpaceMouse drivers that only publish a report on the press edge
+        # without permitting an unplugged device to hold a gripper forever.
+        button_timeout_s = (
+            self.config.button_hold_timeout_s
+            if any(self._buttons)
+            else self.config.stale_timeout_s
+        )
+        buttons_valid = self._last_button_at is not None and button_age_s <= button_timeout_s
         control_axes = calibrated.copy() if valid and self._zero_bias_locked else np.zeros(6, dtype=np.float64)
+        if not translation_fresh:
+            control_axes[:3] = 0.0
+        if not rotation_fresh:
+            control_axes[3:] = 0.0
         return MotionSample(
             self._raw_axes.copy(), self._buttons, valid, self._armed, now, self._error, buttons_valid,
             control_axes, self._zero_bias.copy(), self._zero_bias_locked, self._calibration_state,
@@ -257,6 +298,8 @@ class SpaceMouseHid:
         self._buttons = (False,) * 8
         self._opened_at = None
         self._last_motion_at = None
+        self._last_translation_at = None
+        self._last_rotation_at = None
         self._last_button_at = None
         self._armed = False
         self._zero_bias.fill(0.0)

@@ -91,6 +91,7 @@ class TriViewCompositor:
         laser: LaserPointer | None = None,
         clock: Callable[[], float] = time.monotonic,
         cv2_module: Any | None = None,
+        overlay: Callable[[np.ndarray, dict[str, tuple[int, int, int, int]]], Any] | None = None,
     ) -> None:
         if not isinstance(config, TriViewConfig):
             raise TypeError("config must be a validated TriViewConfig")
@@ -99,6 +100,9 @@ class TriViewCompositor:
         self.key_handler = key_handler
         self.on_close = on_close
         self.laser = laser
+        # Optional pixel-only annotator: called with the composed RGB image and
+        # each panel's (x, y, width, height) before it is shown or saved.
+        self.overlay = overlay
         self._clock = clock
         self._cv2 = cv2_module
         self._window_created = False
@@ -272,6 +276,68 @@ class TriViewCompositor:
                 pass
         return canvas
 
+    def panel_rects(self) -> dict[str, tuple[int, int, int, int]]:
+        """``(x, y, width, height)`` of each panel inside the composite."""
+
+        sizes = self.config.panel_sizes
+        gutter = self.config.gutter_px
+        front_w, front_h = sizes["front"]
+        wrist_w, wrist_h = sizes["wrist"]
+        side_w, side_h = sizes["side"]
+        if self.config.layout == "main_left":
+            return {"front": (0, 0, front_w, front_h), "wrist": (front_w + gutter, 0, wrist_w, wrist_h),
+                    "side": (front_w + gutter, wrist_h + gutter, side_w, side_h)}
+        return {"front": (0, 0, front_w, front_h), "wrist": (0, front_h + gutter, wrist_w, wrist_h),
+                "side": (wrist_w + gutter, front_h + gutter, side_w, side_h)}
+
+    def _overlay_wrist_laser_aim(self, frame: np.ndarray) -> bool:
+        """Draw the palm-laser aim point in its co-linear first-person view.
+
+        A physical cylinder begins behind the palm camera and therefore is
+        either invisible or fills the whole first-person panel.  When that
+        cylinder is intentionally hidden for the wrist panel, this red
+        crosshair is the exact same ray's forward intersection: the camera is
+        aligned with the palm normal, so its optical centre is the laser aim.
+        It changes only the composed RGB image, never MuJoCo state.
+        """
+
+        if self.laser is None:
+            return False
+        record = getattr(self.laser, "last_update", {})
+        config = getattr(self.laser, "config", None)
+        if not isinstance(record, dict) or not record.get("active") or config is None:
+            return False
+        if "wrist" in tuple(getattr(config, "visible_views", ())):
+            return False
+        width, height = self.config.panel_sizes["wrist"]
+        if self.config.layout == "main_left":
+            x0, y0 = self.config.image_width + self.config.gutter_px, 0
+        else:
+            x0, y0 = 0, self.config.image_height + self.config.gutter_px
+        center_x, center_y = x0 + width // 2, y0 + height // 2
+        radius = max(8, min(width, height) // 12)
+        red = np.array((255, 20, 20), dtype=np.uint8)
+        # The two lines and centre dot stay entirely inside the wrist panel.
+        frame[center_y - 1:center_y + 2, center_x - radius:center_x + radius + 1] = red
+        frame[center_y - radius:center_y + radius + 1, center_x - 1:center_x + 2] = red
+        frame[center_y - 3:center_y + 4, center_x - 3:center_x + 4] = red
+        try:
+            cv2 = self._load_cv2()
+            cv2.putText(
+                frame,
+                "PALM LASER AIM",
+                (x0 + 8, y0 + 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (255, 40, 40),
+                1,
+                cv2.LINE_AA,
+            )
+        except Exception:
+            # The reticle remains valid in render-only test environments.
+            pass
+        return True
+
     def _notify_closed(self) -> None:
         if self._close_notified:
             return
@@ -294,7 +360,10 @@ class TriViewCompositor:
                 )
                 self._window_created = True
             # MuJoCo offscreen render output is RGB while HighGUI expects BGR.
-            cv2.imshow(self.config.window_name, frame[..., ::-1])
+            # cvtColor is ~6x cheaper than imshow on a strided [..., ::-1] view.
+            convert = getattr(cv2, "cvtColor", None)
+            bgr = convert(frame, cv2.COLOR_RGB2BGR) if convert is not None else frame[..., ::-1]
+            cv2.imshow(self.config.window_name, bgr)
             raw_key = int(cv2.waitKey(1))
             key = None if raw_key < 0 else raw_key & 0xFF
             action = self.key_handler(key) if key is not None and self.key_handler is not None else None
@@ -372,6 +441,14 @@ class TriViewCompositor:
             for view, size in panel_sizes.items()
         )
         frame = self._compose(frames, status_text)
+        wrist_laser_aim_overlay = self._overlay_wrist_laser_aim(frame)
+        overlay_error = None
+        if self.overlay is not None:
+            try:
+                self.overlay(frame, self.panel_rects())
+            except Exception as exc:
+                # Annotations are optional; never stop the control loop for them.
+                overlay_error = f"{type(exc).__name__}: {exc}"
         self.last_frames = {name: image.copy() for name, image in frames.items()}
         self.last_frame = frame.copy()
         self._last_render_at = now
@@ -400,12 +477,15 @@ class TriViewCompositor:
                     else float(1.0 / (now - prior_render_at))
                 ),
                 "key": key,
+                "wrist_laser_aim_overlay": wrist_laser_aim_overlay,
             }
         )
         if action is not None:
             record["key_action"] = action
         if gui_error is not None:
             record["gui_error"] = gui_error
+        if overlay_error is not None:
+            record["overlay_error"] = overlay_error
         record["closed"] = bool(self._closed)
         return record
 
@@ -463,6 +543,7 @@ class LaserPointer:
         self._visual_site_name: str | None = None
         self._visual_body_id = -1
         self._excluded_geom_ids: set[int] = set()
+        self._robot_geom_rgba: dict[int, np.ndarray] = {}
         self._original: dict[str, np.ndarray] = {}
         self._available = False
         self._active = False
@@ -565,6 +646,10 @@ class LaserPointer:
                 "site_sameframe": np.asarray(self.model.site_sameframe[self._visual_site_id]).copy(),
             }
             self._excluded_geom_ids = self._robot_geom_ids(self._start_site_id)
+            self._robot_geom_rgba = {
+                geom_id: np.asarray(self.model.geom_rgba[geom_id], dtype=np.float64).copy()
+                for geom_id in self._excluded_geom_ids
+            }
         except Exception as exc:
             self._reason = f"site_setup_failed:{type(exc).__name__}:{exc}"
             return
@@ -713,6 +798,9 @@ class LaserPointer:
         """Temporarily hide the visual site from a configured compositor panel."""
         if not self._available or not self._active:
             return False
+        self._set_robot_wrist_visibility(hidden=(
+            view == "wrist" and self.config.hide_robot_in_wrist_view
+        ))
         color = np.asarray(self.config.color_rgba, dtype=np.float64)
         if view not in self.config.visible_views:
             color[3] = 0.0
@@ -720,12 +808,31 @@ class LaserPointer:
         self.model.site_rgba[self._visual_site_id] = color
         return bool(color[3] > 0.0)
 
+    def _set_robot_wrist_visibility(self, *, hidden: bool) -> None:
+        """Hide only robot visuals for an attached palm-camera render.
+
+        The field of view originates within a few centimetres of the palm, so
+        leaving the robot visible produces black finger / wrist silhouettes
+        rather than the useful table-and-object targeting view. This mutates
+        render alpha only and is restored before any other panel or physics
+        step sees the model.
+        """
+
+        if self.model is None:
+            return
+        for geom_id, original in self._robot_geom_rgba.items():
+            color = original.copy()
+            if hidden:
+                color[3] = 0.0
+            self.model.geom_rgba[geom_id] = color
+
     def restore_render_visibility(self) -> None:
         """Return per-render alpha changes to the configured laser opacity."""
         if not self._available or not self._active:
             return
         assert self.model is not None
         self.model.site_rgba[self._visual_site_id] = np.asarray(self.config.color_rgba, dtype=np.float64)
+        self._set_robot_wrist_visibility(hidden=False)
 
     def restore(self) -> bool:
         """Restore every changed visual field exactly; physics arrays are untouched."""
@@ -737,6 +844,7 @@ class LaserPointer:
         self.model.site_size[self._visual_site_id] = self._original["site_size"]
         self.model.site_rgba[self._visual_site_id] = self._original["site_rgba"]
         self.model.site_sameframe[self._visual_site_id] = self._original["site_sameframe"]
+        self._set_robot_wrist_visibility(hidden=False)
         self._forward()
         self._active = False
         return True

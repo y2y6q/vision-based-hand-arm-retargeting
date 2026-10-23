@@ -101,6 +101,45 @@ class HandInputTests(unittest.TestCase):
         worker.close()
         self.assertFalse(worker.running)
 
+    def test_camera_worker_prefers_one_directshow_capture_then_falls_back_only_if_needed(self):
+        class Capture:
+            def __init__(self, opened):
+                self.opened = opened
+                self.release_calls = 0
+
+            def isOpened(self):
+                return self.opened
+
+            def release(self):
+                self.release_calls += 1
+
+        class Cv2:
+            CAP_DSHOW = 700
+
+            def __init__(self, captures):
+                self.captures = list(captures)
+                self.calls = []
+
+            def VideoCapture(self, index, *backend):
+                self.calls.append((index, backend))
+                return self.captures.pop(0)
+
+        first = Capture(True)
+        cv2 = Cv2([first])
+        capture, backend = CameraHandWorker._open_camera_capture(cv2, 2)
+        self.assertIs(capture, first)
+        self.assertEqual(backend, "CAP_DSHOW")
+        self.assertEqual(cv2.calls, [(2, (cv2.CAP_DSHOW,))])
+        self.assertEqual(first.release_calls, 0)
+
+        unavailable, fallback = Capture(False), Capture(True)
+        cv2 = Cv2([unavailable, fallback])
+        capture, backend = CameraHandWorker._open_camera_capture(cv2, 1)
+        self.assertIs(capture, fallback)
+        self.assertEqual(backend, "CAP_ANY")
+        self.assertEqual(unavailable.release_calls, 1)
+        self.assertEqual(cv2.calls, [(1, (cv2.CAP_DSHOW,)), (1, ())])
+
     def test_camera_display_routes_keys_and_window_close_without_opening_another_capture(self):
         class Gui:
             WND_PROP_VISIBLE = 0
@@ -156,6 +195,17 @@ class HandInputTests(unittest.TestCase):
         )
         worker._draw_display(gui, frame, held, handedness=None, timestamp=10.1)
         self.assertTrue(any("DEX HOLD" in line for line in gui.text))
+        gui.text.clear()
+        rejected_left = HandCommand(
+            joint_targets=np.zeros(16), valid=False, timestamp_s=10.2,
+            tracking_state="lost_hold", calibration_state="dex", curls=np.zeros(4),
+            details={
+                "algorithm": "dex-retargeting",
+                "rejected_frame_reason": "DexFrameRejected: expected right hand for Allegro right but MediaPipe reported left",
+            },
+        )
+        worker._draw_display(gui, frame, rejected_left, handedness="Left", timestamp=10.2)
+        self.assertTrue(any("physical RIGHT hand" in line for line in gui.text))
         worker._show_frame(gui, frame)
         self.assertTrue(router.take_reset())
         gui.visible = 0.0
@@ -178,6 +228,60 @@ class HandInputTests(unittest.TestCase):
             ),
             0,
         )
+
+    def test_camera_worker_normalizes_raw_camera_handedness_before_dex(self):
+        self.assertEqual(
+            CameraHandWorker._physical_handedness("Left", detector_input_is_mirrored=False), "Right"
+        )
+        self.assertEqual(
+            CameraHandWorker._physical_handedness("Right", detector_input_is_mirrored=True), "Right"
+        )
+
+    def test_camera_worker_uses_its_actual_detector_mirror_setting(self):
+        """The no-mirror CLI path must not mislabel a physical right hand."""
+
+        worker = CameraHandWorker(HandInputAdapter(), display=False, mirror_input=False)
+        self.assertFalse(worker.mirror_input)
+        self.assertEqual(
+            CameraHandWorker._physical_handedness(
+                "Left", detector_input_is_mirrored=worker.mirror_input
+            ),
+            "Right",
+        )
+
+    def test_camera_display_is_published_then_shown_from_the_caller_thread(self):
+        """The capture worker never needs to own HighGUI beside tri-view."""
+
+        class Gui:
+            WND_PROP_VISIBLE = 0
+
+            def __init__(self):
+                self.frames = 0
+
+            def imshow(self, _name, _frame):
+                self.frames += 1
+
+            @staticmethod
+            def waitKey(_delay):
+                return -1
+
+            @staticmethod
+            def getWindowProperty(_name, _property):
+                return 1.0
+
+        from unittest.mock import patch
+
+        worker = CameraHandWorker(HandInputAdapter(), display=True)
+        frame = np.zeros((24, 32, 3), dtype=np.uint8)
+        with worker._display_lock:
+            worker._latest_display_frame = frame
+            worker._latest_display_timestamp = 12.5
+        gui = Gui()
+        with patch.dict(sys.modules, {"cv2": gui}):
+            record = worker.show_latest()
+        self.assertTrue(record["rendered"])
+        self.assertEqual(record["frame_timestamp_s"], 12.5)
+        self.assertEqual(gui.frames, 1)
 
     def test_camera_worker_pairs_selected_dex_hand_with_matching_world_landmarks(self):
         """Right-hand selection must not accidentally send index-zero 3-D points."""

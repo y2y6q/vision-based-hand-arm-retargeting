@@ -8,8 +8,8 @@
     350.0
   ],
   "axis_order": [
-    1,
     0,
+    1,
     2,
     3,
     4,
@@ -17,11 +17,11 @@
   ],
   "axis_inversion": [
     1,
-    1,
+    -1,
     -1,
     1,
-    1,
-    1
+    -1,
+    -1
   ],
   "device_to_world": [
     [
@@ -52,8 +52,12 @@
   "max_translation_delta_m": 0.004,
   "max_rotation_delta_rad": 0.04,
   "smoothing_alpha": 0.35,
+  "motion_coupling": "dominant",
+  "dominant_switch_ratio": 1.5,
+  "axis_snap_ratio": 0.3,
   "control_hz": 20.0,
   "stale_timeout_s": 0.25,
+  "button_hold_timeout_s": 6.0,
   "discovery_interval_s": 0.5,
   "hand_gestures": {
     "left_button_index": 0,
@@ -147,7 +151,9 @@
     "stale_timeout_s": 0.5,
     "expected_handedness": "Right",
     "input_is_mirrored": false,
-    "runtime": "auto"
+    "runtime": "auto",
+    "relative_motion": true,
+    "relative_motion_gain": 1.0
   },
   "grasp_telemetry": {
     "lift_height_m": 0.03,

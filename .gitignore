@@ -9,6 +9,7 @@ htmlcov/
 
 # Local environments and package outputs
 .venv-robosuite/
+.venv-libero/
 .venv/
 venv/
 env/
@@ -23,6 +24,11 @@ tmp/
 outputs/
 MUJOCO_LOG.TXT
 *.log
+
+# External clone (installed into .venv-libero, not redistributed) and an
+# unrelated course project kept in the same folder
+third_party/LIBERO/
+lab2_rl_vlm/
 
 # Operating-system files
 .DS_Store

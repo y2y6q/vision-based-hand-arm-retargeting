@@ -17,7 +17,7 @@ from .hand_gestures import (
     HandGestureCommand,
     HandGestureConfig,
 )
-from .hand_input import HandCommand, estimate_all_finger_curls
+from .hand_input import HandCommand, _point, estimate_all_finger_curls
 from .shadow_gripper import SHADOW_ACTUATOR_NAMES
 
 
@@ -30,8 +30,73 @@ _CURL_WEIGHTS = np.array(
     dtype=np.float64,
 )
 
+# Shadow's thumb is not a fourth ordinary finger.  THJ5 / THJ3 orient the
+# thumb across the palm while THJ4 / THJ2 / THJ1 bend it.  A single positive
+# "thumb curl" cannot represent that opposition motion, particularly when a
+# person pinches with an extended thumb.  These are signed fractions of the
+# available travel from the neutral (zero) target, in THJ5..THJ1 order.
+#
+# The index profile preserves the existing full-curl pose.  The middle profile
+# was selected with the loaded right-hand MuJoCo model: it turns the thumb
+# across the palm and reverses THJ2, reducing the thumb--middle tip-centre
+# separation compared with the old all-positive curl mapping.
+_THUMB_INDEX_PINCH_FRACTIONS = np.array([0.18, 0.62, 0.15, 0.74, 0.86], dtype=np.float64)
+_THUMB_MIDDLE_PINCH_FRACTIONS = np.array([0.573, 0.90, 0.86, -0.358, 0.446], dtype=np.float64)
+_THUMB_SLICE = slice(2, 7)
+_PINCH_PARTNERS = ("index", "middle", "ring", "little")
+_PINCH_CONTACT_RATIO = 0.35
+_PINCH_RELEASE_RATIO = 0.90
+_PINCH_PARTNER_CURL_FLOOR = 0.80
+# Ignore weak incidental tip proximity. A real pinch normally yields a value
+# close to one; the threshold prevents a nearly-open neighbor from changing
+# the thumb's opposition profile frame to frame.
+_PINCH_ACTIVATION_STRENGTH = 0.25
 
-def curls_to_shadow_targets(curls: Sequence[float], lower_limits: Sequence[float], upper_limits: Sequence[float]) -> np.ndarray:
+
+def estimate_thumb_pinch_strengths(landmarks: Sequence[Any]) -> np.ndarray:
+    """Estimate thumb-tip contact with index, middle, ring, and little tips.
+
+    The values are scale-normalized by the MCP span, so a hand moving closer
+    to the webcam does not itself close the robot.  This deliberately adds a
+    pinch cue to the existing curl estimator; it does not replace the normal
+    per-finger curls used for free hand motion.
+    """
+    if len(landmarks) != 21:
+        raise ValueError("MediaPipe hand input must contain exactly 21 landmarks")
+    points = [_point(landmark) for landmark in landmarks]
+    palm_span = float(np.linalg.norm(points[5] - points[17]))
+    if not np.isfinite(palm_span) or palm_span < 1e-6:
+        raise ValueError("MediaPipe palm span must be finite and non-zero")
+    thumb_tip = points[4]
+    ratios = np.array(
+        [float(np.linalg.norm(thumb_tip - points[index])) / palm_span for index in (8, 12, 16, 20)],
+        dtype=np.float64,
+    )
+    return np.clip(
+        (_PINCH_RELEASE_RATIO - ratios) / (_PINCH_RELEASE_RATIO - _PINCH_CONTACT_RATIO),
+        0.0,
+        1.0,
+    )
+
+
+def _thumb_target_from_signed_fractions(
+    fractions: np.ndarray, lower: np.ndarray, upper: np.ndarray
+) -> np.ndarray:
+    """Convert safe signed neutral-relative thumb fractions into targets."""
+    opened = np.clip(np.zeros(5, dtype=np.float64), lower, upper)
+    positive_travel = upper - opened
+    negative_travel = opened - lower
+    travel = np.where(fractions >= 0.0, positive_travel, negative_travel)
+    return np.clip(opened + fractions * travel, lower, upper)
+
+
+def curls_to_shadow_targets(
+    curls: Sequence[float],
+    lower_limits: Sequence[float],
+    upper_limits: Sequence[float],
+    *,
+    thumb_pinch_strengths: Sequence[float] | None = None,
+) -> np.ndarray:
     """Map MediaPipe's index/middle/ring/thumb curls to 20 actuator targets.
 
     The ring curl intentionally drives both ring and little fingers because
@@ -45,14 +110,56 @@ def curls_to_shadow_targets(curls: Sequence[float], lower_limits: Sequence[float
         raise ValueError("expected four curls and 20 ordered Shadow actuator limits")
     if not np.all(np.isfinite(curls)) or not np.all(np.isfinite(lower)) or not np.all(np.isfinite(upper)) or not np.all(upper > lower):
         raise ValueError("curls and Shadow limits must be finite and ordered")
+    resolved_curls = np.clip(curls, 0.0, 1.0).copy()
+    strengths: np.ndarray | None = None
+    active_partners = np.zeros(4, dtype=bool)
+    pinch_strength = 0.0
+    if thumb_pinch_strengths is not None:
+        strengths = np.asarray(thumb_pinch_strengths, dtype=np.float64)
+        if strengths.shape != (4,) or not np.all(np.isfinite(strengths)):
+            raise ValueError("thumb_pinch_strengths must contain four finite values")
+        strengths = np.clip(strengths, 0.0, 1.0)
+        active_partners = strengths >= _PINCH_ACTIVATION_STRENGTH
+        if np.any(active_partners):
+            pinch_strength = float(np.max(strengths[active_partners]))
+            # A human three-finger pinch exposes two thumb-tip contacts at
+            # once. The original implementation kept only argmax(strengths),
+            # so the other robot finger stayed open. Engage every confirmed
+            # partner; ring and little intentionally share the legacy third
+            # curl channel.
+            for partner_index in np.flatnonzero(active_partners):
+                curl_index = min(int(partner_index), 2)
+                resolved_curls[curl_index] = max(
+                    resolved_curls[curl_index],
+                    float(strengths[partner_index]) * _PINCH_PARTNER_CURL_FLOOR,
+                )
+
     # Existing estimator order is index, middle, ring/pinky, thumb.
     per_actuator_curl = np.array([
-        0, 0, curls[3], curls[3], curls[3], curls[3], curls[3],
-        curls[0], curls[0], curls[0], curls[1], curls[1], curls[1],
-        curls[2], curls[2], curls[2], curls[2], curls[2], curls[2], curls[2],
+        0, 0, resolved_curls[3], resolved_curls[3], resolved_curls[3], resolved_curls[3], resolved_curls[3],
+        resolved_curls[0], resolved_curls[0], resolved_curls[0],
+        resolved_curls[1], resolved_curls[1], resolved_curls[1],
+        resolved_curls[2], resolved_curls[2], resolved_curls[2], resolved_curls[2], resolved_curls[2], resolved_curls[2], resolved_curls[2],
     ], dtype=np.float64)
     opened = np.clip(np.zeros(20, dtype=np.float64), lower, upper)
     targets = opened + np.clip(per_actuator_curl, 0.0, 1.0) * _CURL_WEIGHTS * (upper - opened)
+    targets = np.clip(targets, lower, upper)
+    if strengths is None or pinch_strength <= 0.0:
+        return targets
+
+    # A thumb--index pinch remains the most compact opposition profile even
+    # when middle also joins it for a tripod grip. Without index, a cross-palm
+    # thumb profile brings the thumb toward middle / ring / little. This is a
+    # deliberate contact-set choice, not an unstable argmax-only switch.
+    profile = (
+        _THUMB_INDEX_PINCH_FRACTIONS
+        if active_partners[0]
+        else _THUMB_MIDDLE_PINCH_FRACTIONS
+    )
+    opposition = _thumb_target_from_signed_fractions(profile, lower[_THUMB_SLICE], upper[_THUMB_SLICE])
+    targets[_THUMB_SLICE] = (
+        (1.0 - pinch_strength) * targets[_THUMB_SLICE] + pinch_strength * opposition
+    )
     return np.clip(targets, lower, upper)
 
 
@@ -71,6 +178,7 @@ class ShadowLegacyHandInput:
         self.stale_timeout_s = float(stale_timeout_s)
         self._targets = np.clip(np.zeros(20), self.lower_limits, self.upper_limits)
         self._curls = np.zeros(4, dtype=np.float64)
+        self._pinch_strengths = np.zeros(4, dtype=np.float64)
         self._timestamp = 0.0
         self._tracking_state = "waiting_for_hand"
         self._error: str | None = None
@@ -86,20 +194,43 @@ class ShadowLegacyHandInput:
             timestamp_s=self._timestamp if timestamp is None else timestamp,
             tracking_state=self._tracking_state, calibration_state=self.calibration_state,
             curls=self._curls.copy(), error=self._error,
-            details={"algorithm": "shadow-legacy-curl", "actuator_order": list(SHADOW_ACTUATOR_NAMES)},
+            details={
+                "algorithm": "shadow-legacy-curl-plus-pinch",
+                "actuator_order": list(SHADOW_ACTUATOR_NAMES),
+                "thumb_pinch_strengths": self._pinch_strengths.copy(),
+                "thumb_pinch_partners": [
+                    _PINCH_PARTNERS[index]
+                    for index, strength in enumerate(self._pinch_strengths)
+                    if strength >= _PINCH_ACTIVATION_STRENGTH
+                ],
+                "thumb_pinch_profile": (
+                    "index"
+                    if self._pinch_strengths[0] >= _PINCH_ACTIVATION_STRENGTH
+                    else (
+                        "cross_palm"
+                        if float(np.max(self._pinch_strengths)) >= _PINCH_ACTIVATION_STRENGTH
+                        else None
+                    )
+                ),
+            },
         )
 
     def update_landmarks(self, landmarks: Sequence[Any], timestamp_s: float | None = None) -> HandCommand:
         timestamp = time.monotonic() if timestamp_s is None else float(timestamp_s)
         try:
             curls = estimate_all_finger_curls(landmarks)
-            raw = curls_to_shadow_targets(curls, self.lower_limits, self.upper_limits)
+            pinch_strengths = estimate_thumb_pinch_strengths(landmarks)
+            raw = curls_to_shadow_targets(
+                curls, self.lower_limits, self.upper_limits,
+                thumb_pinch_strengths=pinch_strengths,
+            )
         except (TypeError, ValueError, IndexError) as exc:
             return self.mark_lost(timestamp, f"invalid landmarks: {exc}")
         with self._lock:
             self._targets = self.smoothing_alpha * raw + (1.0 - self.smoothing_alpha) * self._targets
             self._targets = np.clip(self._targets, self.lower_limits, self.upper_limits)
-            self._curls, self._timestamp, self._tracking_state, self._error = curls, timestamp, "tracking", None
+            self._curls, self._pinch_strengths = curls, pinch_strengths
+            self._timestamp, self._tracking_state, self._error = timestamp, "tracking", None
             return self._command_locked(valid=True)
 
     def mark_lost(self, timestamp_s: float | None = None, error: str | None = None) -> HandCommand:
@@ -121,6 +252,7 @@ class ShadowLegacyHandInput:
         with self._lock:
             self._targets = np.clip(np.zeros(20), self.lower_limits, self.upper_limits)
             self._curls = np.zeros(4, dtype=np.float64)
+            self._pinch_strengths = np.zeros(4, dtype=np.float64)
             self._timestamp, self._tracking_state, self._error = timestamp, "waiting_for_hand", None
             return self._command_locked(valid=False, timestamp=timestamp)
 
@@ -154,8 +286,13 @@ class ShadowHandGestureController:
             raise ValueError("Shadow gesture joint limits must be ordered")
 
         self._targets = {
-            THUMB_INDEX_PINCH: self._target_for_curls(config.thumb_index_pinch_curls),
-            FOUR_FINGER_PINCH: self._target_for_curls(config.four_finger_pinch_curls),
+            # Use the same tested opposition geometry as camera pinches.
+            THUMB_INDEX_PINCH: self._target_for_curls(
+                config.thumb_index_pinch_curls, pinch_strengths=(1.0, 0.0, 0.0, 0.0)
+            ),
+            FOUR_FINGER_PINCH: self._target_for_curls(
+                config.four_finger_pinch_curls, pinch_strengths=(1.0, 1.0, 1.0, 0.0)
+            ),
             SAFE_OPEN_HOLD: self._target_for_curls(config.safe_open_curls),
         }
         self._previous_buttons: tuple[bool, ...] = ()
@@ -173,9 +310,19 @@ class ShadowHandGestureController:
             raise ValueError(f"{name} must contain 20 finite values")
         return values.copy()
 
-    def _target_for_curls(self, curls: Sequence[float]) -> np.ndarray:
+    def _target_for_curls(
+        self,
+        curls: Sequence[float],
+        *,
+        pinch_strengths: Sequence[float] | None = None,
+    ) -> np.ndarray:
         target = np.asarray(
-            curls_to_shadow_targets(curls, self.lower_limits, self.upper_limits),
+            curls_to_shadow_targets(
+                curls,
+                self.lower_limits,
+                self.upper_limits,
+                thumb_pinch_strengths=pinch_strengths,
+            ),
             dtype=np.float64,
         )
         if target.shape != (20,) or not np.all(np.isfinite(target)):

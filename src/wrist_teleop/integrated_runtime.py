@@ -22,14 +22,18 @@ def reset_integrated_environment(
     buttons: Sequence[bool] = (),
     keypress_callback: Callable[[int], None] | None = None,
     timestamp_s: float | None = None,
+    settle_duration_s: float = 0.0,
 ) -> tuple[PandaAllegroActionComposer, AllegroHandGestureController, HandGestureCommand, np.ndarray]:
     """Perform one complete R-key reset without reopening HID or camera.
 
     The reset order intentionally clears input state after robosuite rebuilds
-    its world. A safe-open hand command is stepped once so the new Allegro
-    position actuators receive a bounded target before normal teleoperation
-    resumes. Any button currently held seeds edge detection and therefore
-    cannot retrigger a gesture immediately after reset.
+    its world. A safe-open hand command is stepped before normal teleoperation
+    resumes. ``settle_duration_s`` uses ordinary MuJoCo steps to let a mounted
+    hand reach that safe-open target before the OSC goal is latched again. It
+    matches the Shadow entry's reset discipline; it never writes object poses,
+    disables gravity, or changes controller settings. Any button currently
+    held seeds edge detection and therefore cannot retrigger a gesture
+    immediately after reset.
     """
     env.reset()
     if keypress_callback is not None:
@@ -54,7 +58,20 @@ def reset_integrated_environment(
     if len(button_state) < required_button_count:
         button_state = (False,) * required_button_count
     hand_command = gestures.reset(buttons=button_state, timestamp_s=timestamp_s)
+    if not np.isfinite(settle_duration_s) or settle_duration_s < 0.0:
+        raise ValueError("settle_duration_s must be a finite nonnegative number")
     action = composer.compose(np.zeros(6, dtype=np.float64), hand_command.joint_targets)
+    if settle_duration_s > 0.0:
+        control_hz = float(getattr(getattr(mapper, "config", None), "control_hz", 20.0))
+        if not np.isfinite(control_hz) or control_hz <= 0.0:
+            raise ValueError("mapper config must expose a positive control_hz")
+        settle_steps = max(1, int(round(settle_duration_s * control_hz)))
+        for _ in range(settle_steps):
+            env.step(action)
+        # The arm may have moved while the hand reached its bounded initial
+        # target. Capture that settled pose so a neutral SpaceMouse begins at
+        # an exact zero OSC increment, as the Shadow program does.
+        composer.initialize_goal()
     env.step(action)
     return composer, gestures, hand_command, action
 

@@ -8,6 +8,9 @@
 *.json text eol=lf
 *.npz binary
 *.png binary
+*.jpg binary
+*.gif binary
+*.mp4 binary
 *.obj binary
 *.glb binary
 *.mtl text eol=lf

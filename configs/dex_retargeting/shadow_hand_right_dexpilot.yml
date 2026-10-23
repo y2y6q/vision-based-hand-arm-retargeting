@@ -1,0 +1,22 @@
+# Project-local derivative of dex-retargeting 0.4.6
+# dex_retargeting/configs/teleop/shadow_hand_right_dexpilot.yml (MIT, Yuzhe Qin).
+# Only change: target_joint_names omits WRJ2 / WRJ1. The SpaceMouse owns the
+# wrist pose, so the solver keeps both wrist joints fixed at 0 and spends all
+# of its freedom on the fingers and thumb.
+retargeting:
+  type: DexPilot
+  urdf_path: shadow_hand/shadow_hand_right.urdf
+
+  # Target refers to the retargeting target, which is the robot hand
+  wrist_link_name: "ee_link"
+  finger_tip_link_names: [ "thtip", "fftip", "mftip", "rftip", "lftip" ]
+  scaling_factor: 1.2
+
+  target_joint_names: [ "FFJ4", "FFJ3", "FFJ2", "FFJ1",
+                        "MFJ4", "MFJ3", "MFJ2", "MFJ1",
+                        "RFJ4", "RFJ3", "RFJ2", "RFJ1",
+                        "LFJ5", "LFJ4", "LFJ3", "LFJ2", "LFJ1",
+                        "THJ5", "THJ4", "THJ3", "THJ2", "THJ1" ]
+
+  # A smaller alpha means stronger filtering, i.e. more smooth but also larger latency
+  low_pass_alpha: 0.2

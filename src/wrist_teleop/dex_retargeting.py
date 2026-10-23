@@ -40,6 +40,12 @@ OFFICIAL_WHEEL = (
 )
 OFFICIAL_WHEEL_SHA256 = "cf08b93e204af21b7146f12a83d55f0a0d227f991d202655c475535621bb62f7"
 DEX_SIDECAR_WORKER = PROJECT_ROOT / "scripts" / "dex_retargeting_worker.py"
+# The isolated official stack imports Pinocchio, Torch, and the solver's
+# complete robot model. A cold Windows launch was measured at about 56 seconds
+# on this workstation, so the old 30-second allowance incorrectly rejected a
+# healthy solver before it could reply. This applies only to one-time startup;
+# per-frame retarget requests keep their short normal timeout.
+DEX_SIDECAR_INIT_TIMEOUT_S = 90.0
 OFFICIAL_URDF_ROOT = (
     PROJECT_ROOT
     / "third_party"
@@ -80,6 +86,48 @@ def _mirrored_label(label: str) -> str:
     return "left" if label == "right" else "right"
 
 
+def _estimate_mediapipe_wrist_frame(wrist_relative: np.ndarray) -> np.ndarray:
+    """Return dex-retargeting's right-handed wrist frame for 21 landmarks.
+
+    This is the geometric frame construction used by the official
+    ``single_hand_detector.py`` example: it derives a stable palm frame from
+    the wrist, index MCP (5), and middle MCP (9), then resolves its normal
+    sign from the index-to-middle direction.  Keeping this small dependency-
+    free copy here lets the robosuite process use the exact input convention
+    without importing the example-only MediaPipe helper into the dex sidecar.
+    """
+
+    palm_points = wrist_relative[[0, 5, 9], :]
+    palm_area = float(np.linalg.norm(np.cross(palm_points[1] - palm_points[0], palm_points[2] - palm_points[0])))
+    if not np.isfinite(palm_area) or palm_area < 1e-10:
+        raise DexFrameRejected("camera palm landmarks are degenerate")
+    x_vector = palm_points[0] - palm_points[2]
+    centered = palm_points - np.mean(palm_points, axis=0, keepdims=True)
+    _, _, right_singular_vectors = np.linalg.svd(centered)
+    normal = right_singular_vectors[2, :]
+
+    # Gram--Schmidt orthonormalization, matching the official helper.  Bad or
+    # nearly collinear camera landmarks must produce a safe rejected frame,
+    # never an arbitrary robot-hand jump.
+    x = x_vector - np.dot(x_vector, normal) * normal
+    x_norm = float(np.linalg.norm(x))
+    if not np.isfinite(x_norm) or x_norm < 1e-8:
+        raise DexFrameRejected("camera palm landmarks cannot define a stable wrist frame")
+    x /= x_norm
+    z = np.cross(x, normal)
+    z_norm = float(np.linalg.norm(z))
+    if not np.isfinite(z_norm) or z_norm < 1e-8:
+        raise DexFrameRejected("camera palm landmarks cannot define a stable wrist normal")
+    z /= z_norm
+    if float(np.dot(z, palm_points[1] - palm_points[2])) < 0.0:
+        normal *= -1.0
+        z *= -1.0
+    frame = np.stack((x, normal, z), axis=1)
+    if not np.all(np.isfinite(frame)):
+        raise DexFrameRejected("camera palm landmarks produced a non-finite wrist frame")
+    return frame
+
+
 def mediapipe_world_to_mano(
     landmarks: Sequence[Any],
     *,
@@ -90,7 +138,11 @@ def mediapipe_world_to_mano(
     """Convert one MediaPipe 21x3 world-landmark frame into dex MANO space.
 
     MediaPipe world landmarks are metre-valued but use camera/operator axes.
-    The official dex vector config expects wrist-relative MANO coordinates.
+    The official dex vector config expects wrist-relative MANO coordinates in
+    a palm-local frame.  Following the official ``SingleHandDetector``, this
+    first estimates that wrist frame and only then applies the operator-to-
+    MANO transform.  This keeps the finger targets tied to the operator's
+    hand pose instead of to the webcam orientation.
     ``input_is_mirrored`` is intentionally explicit: when callers mirror a
     selfie image before detection, MediaPipe's reported left / right label is
     converted back to the physical hand before the right-Allegro gate.
@@ -114,8 +166,12 @@ def mediapipe_world_to_mano(
             f"expected {expected} hand for Allegro right but MediaPipe reported {observed}"
         )
     wrist_relative = values - values[0:1]
+    mediapipe_wrist_frame = _estimate_mediapipe_wrist_frame(wrist_relative)
     transform = OPERATOR2MANO_RIGHT if expected == "right" else OPERATOR2MANO_LEFT
-    mano = wrist_relative @ transform.T
+    # These are row-vector landmark arrays.  The multiplication order and
+    # non-transposed operator matrix are the same as the official 0.4.6
+    # detector: ``points @ mediapipe_wrist_rot @ operator2mano``.
+    mano = wrist_relative @ mediapipe_wrist_frame @ transform
     if not np.all(np.isfinite(mano)):
         raise DexFrameRejected("camera-to-MANO conversion produced non-finite landmarks")
     return mano
@@ -290,7 +346,7 @@ class _DexSidecar:
     def initialize(self, *, config_path: Path, urdf_root: Path) -> dict[str, Any]:
         return self.request(
             "init",
-            timeout_s=30.0,
+            timeout_s=DEX_SIDECAR_INIT_TIMEOUT_S,
             wheel_path=str(OFFICIAL_WHEEL.resolve()),
             config_path=str(config_path.resolve()),
             urdf_root=str(urdf_root.resolve()),
@@ -365,10 +421,12 @@ class DexRetargetingAdapter:
         config_path: Path = OFFICIAL_CONFIG,
         runtime: str = "auto",
         sidecar_python: str | Path | None = None,
+        reference_landmark_scale: float = 1.0,
     ):
         self.allegro_joint_names = tuple(str(name) for name in allegro_joint_names)
         self.lower_limits = np.asarray(lower_limits, dtype=np.float64)
         self.upper_limits = np.asarray(upper_limits, dtype=np.float64)
+        self.reference_landmark_scale = float(reference_landmark_scale)
         if (
             len(self.allegro_joint_names) != 16
             or len(set(self.allegro_joint_names)) != 16
@@ -377,8 +435,13 @@ class DexRetargetingAdapter:
             or not np.all(np.isfinite(self.lower_limits))
             or not np.all(np.isfinite(self.upper_limits))
             or not np.all(self.upper_limits > self.lower_limits)
+            or not np.isfinite(self.reference_landmark_scale)
+            or self.reference_landmark_scale <= 0.0
         ):
-            raise ValueError("Allegro dex mapping requires 16 distinct names and finite ordered limits")
+            raise ValueError(
+                "Allegro dex mapping requires 16 distinct names, finite ordered limits, "
+                "and a positive reference_landmark_scale"
+            )
         selected_runtime = str(runtime).strip().lower()
         if selected_runtime not in {"auto", "native", "sidecar"}:
             raise ValueError("dex runtime must be 'auto', 'native', or 'sidecar'")
@@ -513,13 +576,18 @@ class DexRetargetingAdapter:
         joints = np.asarray(mano_landmarks_m, dtype=np.float64)
         if joints.shape != (21, 3) or not np.all(np.isfinite(joints)):
             raise DexFrameRejected("dex retargeting requires a finite 21x3 MANO landmark array")
-        ref_value = joints[self.human_indices[1], :] - joints[self.human_indices[0], :]
+        # The official config targets the source-size Allegro URDF. The
+        # MuJoCo hand may be uniformly scaled at runtime, so scale only its
+        # wrist-relative human references before invoking the unchanged
+        # official solver.
+        solver_joints = joints * self.reference_landmark_scale
+        ref_value = solver_joints[self.human_indices[1], :] - solver_joints[self.human_indices[0], :]
         if ref_value.shape != (4, 3) or not np.all(np.isfinite(ref_value)):
             raise DexFrameRejected("official dex vector reference is invalid")
         try:
             with self._solver_lock:
                 if self._sidecar is not None:
-                    result = self._sidecar.request("retarget", mano_landmarks=joints.tolist())
+                    result = self._sidecar.request("retarget", mano_landmarks=solver_joints.tolist())
                     solver_ref = np.asarray(result.get("ref_value"), dtype=np.float64)
                     if solver_ref.shape != (4, 3) or not np.allclose(solver_ref, ref_value, rtol=0.0, atol=1e-12):
                         raise RuntimeError("dex sidecar returned a reference vector inconsistent with the requested MANO frame")
@@ -585,6 +653,7 @@ class DexRetargetingAdapter:
             "human_indices": self.human_indices.tolist(),
             "retargeting_joint_names": list(self.retargeting_joint_names),
             "allegro_joint_names": list(self.allegro_joint_names),
+            "reference_landmark_scale": self.reference_landmark_scale,
             "filtering": "official config low_pass_alpha only; no project output EMA",
             **self._runtime_details,
         }

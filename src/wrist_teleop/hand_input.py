@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+import os
 import threading
 import time
 from typing import Any, Callable, Sequence
@@ -214,6 +215,8 @@ class DexHandInputAdapter:
         stale_timeout_s: float = 0.5,
         expected_handedness: str = "Right",
         input_is_mirrored: bool = False,
+        relative_motion: bool = True,
+        relative_motion_gain: float = 1.0,
     ):
         self.retargeter = retargeter
         self.lower_limits = np.asarray(lower_limits, dtype=np.float64).reshape(16)
@@ -226,12 +229,23 @@ class DexHandInputAdapter:
             or not np.all(np.isfinite(self.upper_limits))
             or not np.all(self.upper_limits > self.lower_limits)
             or stale_timeout_s <= 0
+            or not np.isfinite(relative_motion_gain)
+            or float(relative_motion_gain) <= 0.0
+            or float(relative_motion_gain) > 3.0
         ):
-            raise ValueError("dex hand adapter requires finite 16-joint limits and positive stale timeout")
+            raise ValueError(
+                "dex hand adapter requires finite 16-joint limits, a positive stale timeout, "
+                "and relative_motion_gain in (0, 3]"
+            )
         self.stale_timeout_s = float(stale_timeout_s)
         self.expected_handedness = str(expected_handedness)
         self.input_is_mirrored = bool(input_is_mirrored)
+        self.relative_motion = bool(relative_motion)
+        self.relative_motion_gain = float(relative_motion_gain)
         self._targets = np.clip(np.zeros(16), self.lower_limits, self.upper_limits)
+        self._safe_open_targets = self._targets.copy()
+        self._raw_targets: np.ndarray | None = None
+        self._relative_reference_targets: np.ndarray | None = None
         self._timestamp = 0.0
         self._tracking_state = "waiting_for_hand"
         self._error: str | None = None
@@ -249,7 +263,34 @@ class DexHandInputAdapter:
 
     @property
     def calibration_state(self) -> str:
-        return "MediaPipe world landmarks -> official dex vector retargeting"
+        if not self.relative_motion:
+            return "absolute official dex vector target"
+        if self._relative_reference_targets is None:
+            return "waiting to capture camera-relative dex neutral"
+        return "camera-relative dex neutral captured"
+
+    def recenter_relative_motion(self) -> bool:
+        """Make the newest valid official dex target the camera-relative neutral.
+
+        This does not alter the official solver, MuJoCo state, or joint limits.
+        It simply maps later camera-pose changes around Allegro's safe-open
+        target, so an operator can work from a comfortable open hand.
+        """
+
+        if not self.relative_motion:
+            return False
+        with self._lock:
+            if self._raw_targets is None:
+                return False
+            self._relative_reference_targets = self._raw_targets.copy()
+            self._targets = self._safe_open_targets.copy()
+            self._details = {
+                **self._details,
+                "relative_motion": True,
+                "relative_motion_gain": self.relative_motion_gain,
+                "relative_reference_event": "recentered",
+            }
+            return True
 
     def update_world_landmarks(
         self,
@@ -277,6 +318,17 @@ class DexHandInputAdapter:
         except Exception as exc:
             return self.mark_lost(timestamp, f"dex frame rejected: {type(exc).__name__}: {exc}")
         with self._lock:
+            raw_targets = targets.copy()
+            relative_reference_event: str | None = None
+            if self.relative_motion:
+                if self._relative_reference_targets is None:
+                    self._relative_reference_targets = raw_targets.copy()
+                    relative_reference_event = "captured_first_valid_frame"
+                targets = self._safe_open_targets + self.relative_motion_gain * (
+                    raw_targets - self._relative_reference_targets
+                )
+                targets = np.clip(targets, self.lower_limits, self.upper_limits)
+            self._raw_targets = raw_targets
             self._targets = targets
             self._timestamp = timestamp
             self._tracking_state = "tracking"
@@ -291,8 +343,11 @@ class DexHandInputAdapter:
                 "ref_value_m": np.asarray(result.ref_value, dtype=np.float64),
                 "raw_dex_qpos": np.asarray(result.raw_qpos, dtype=np.float64),
                 "retargeting_joint_names": list(result.retargeting_joint_names),
-                "mapped_allegro_targets_rad": targets.copy(),
+                "mapped_allegro_targets_rad": raw_targets,
                 "clipped_allegro_targets_rad": targets.copy(),
+                "relative_motion": self.relative_motion,
+                "relative_motion_gain": self.relative_motion_gain,
+                "relative_reference_event": relative_reference_event,
             }
             return self._command_locked(valid=True)
 
@@ -344,6 +399,8 @@ class DexHandInputAdapter:
             raise RuntimeError(f"dex history reset failed: {type(exc).__name__}: {exc}") from exc
         with self._lock:
             self._targets = np.clip(np.zeros(16), self.lower_limits, self.upper_limits)
+            self._raw_targets = None
+            self._relative_reference_targets = None
             self._timestamp = timestamp
             self._tracking_state = "waiting_for_hand"
             self._error = None
@@ -351,6 +408,8 @@ class DexHandInputAdapter:
                 "algorithm": "dex-retargeting",
                 "expected_handedness": self.expected_handedness,
                 "input_is_mirrored": self.input_is_mirrored,
+                "relative_motion": self.relative_motion,
+                "relative_motion_gain": self.relative_motion_gain,
                 "history_reset": True,
             }
             return self._command_locked(valid=False, timestamp=timestamp)
@@ -386,12 +445,18 @@ class CameraHandWorker:
         width: int = 640,
         height: int = 480,
         display: bool = True,
+        mirror_input: bool = True,
         keypress_callback: Callable[[int], None] | None = None,
         status_provider: Callable[[], dict[str, Any]] | None = None,
         window_name: str = "Panda + Allegro camera hand input",
+        display_text: bool = True,
     ):
         self.adapter = adapter
         self.camera_index, self.width, self.height, self.display = camera_index, width, height, display
+        # False keeps only the drawn landmarks, for callers that embed the
+        # frame in their own UI (``latest_frame``) instead of this window.
+        self.display_text = bool(display_text)
+        self.mirror_input = bool(mirror_input)
         self.keypress_callback = keypress_callback
         self.status_provider = status_provider
         self.window_name = str(window_name)
@@ -403,8 +468,16 @@ class CameraHandWorker:
         self._display_fps = 0.0
         self._last_dex_update_timestamp: float | None = None
         self._status_lock = threading.Lock()
+        # MediaPipe acquisition stays on its worker, but HighGUI is serviced
+        # by the simulation thread. Windows HighGUI has process-global state;
+        # calling imshow / waitKey from both this worker and the tri-view loop
+        # causes intermittent black or corrupt simulator frames.
+        self._display_lock = threading.Lock()
+        self._latest_display_frame: np.ndarray | None = None
+        self._latest_display_timestamp: float | None = None
         self._capture_lock = threading.Lock()
         self._capture: Any | None = None
+        self._capture_backend = "not_started"
         self._frames_read = 0
         self._frames_processed = 0
         self._read_failures = 0
@@ -440,6 +513,12 @@ class CameraHandWorker:
                 self.adapter.mark_lost(error=self.error)
             else:
                 self._thread = None
+        if self.display:
+            try:
+                import cv2
+                cv2.destroyWindow(self.window_name)
+            except Exception:
+                pass
 
     @property
     def running(self) -> bool:
@@ -459,10 +538,31 @@ class CameraHandWorker:
                 "last_frame_timestamp_s": self._last_frame_timestamp,
                 "detected_handedness": list(self._detected_handedness),
                 "display_fps": self._display_fps,
+                "display_frame_available": self._latest_display_frame is not None,
+                "display_frame_timestamp_s": self._latest_display_timestamp,
                 "window_close_requested": self._window_close_notified,
                 "capture_open": capture_open,
+                "capture_backend": self._capture_backend,
                 "error": self.error,
             }
+
+    @staticmethod
+    def _open_camera_capture(cv2: Any, camera_index: int) -> tuple[Any, str]:
+        """Open one Windows camera with a bounded, reliable backend choice.
+
+        OpenCV's automatic backend can block inside Media Foundation before it
+        publishes a capture object.  DirectShow opens the same UVC devices
+        promptly on this Windows workstation.  Only if DirectShow cannot open
+        the selected index do we release it and try OpenCV's normal backend;
+        at no time are two captures active.
+        """
+
+        if os.name == "nt" and hasattr(cv2, "CAP_DSHOW"):
+            capture = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+            if capture.isOpened():
+                return capture, "CAP_DSHOW"
+            capture.release()
+        return cv2.VideoCapture(camera_index), "CAP_ANY"
 
     def _runtime_status(self) -> dict[str, Any]:
         """Return a detached best-effort status snapshot for overlay drawing."""
@@ -530,6 +630,8 @@ class CameraHandWorker:
         if hand_mode == "dex":
             if is_dex_frame:
                 dex_line = ("DEX ACTIVE: retarget() updated", (40, 220, 40))
+            elif "expected right hand" in str(details.get("rejected_frame_reason", "")).lower():
+                dex_line = ("DEX WAITING: show your physical RIGHT hand", (30, 170, 255))
             elif self._last_dex_update_timestamp is not None and timestamp - self._last_dex_update_timestamp <= 1.0:
                 dex_line = ("DEX HOLD: waiting for next valid frame", (30, 170, 255))
             else:
@@ -542,9 +644,15 @@ class CameraHandWorker:
         ]
         if dex_line is not None:
             lines.append(dex_line)
+        if hand_mode == "dex" and bool(details.get("relative_motion", False)):
+            calibration_event = details.get("relative_reference_event")
+            calibration_text = "DEX RELATIVE: C re-centres your current hand"
+            if calibration_event == "captured_first_valid_frame":
+                calibration_text = "DEX RELATIVE: neutral captured; move your fingers"
+            lines.append((calibration_text, (180, 235, 180)))
         if command.error:
             lines.append((f"input: {command.error[:88]}", (40, 120, 255)))
-        lines.append(("R reset | Q quit | close window = safe quit", (210, 210, 210)))
+        lines.append(("C re-centre dex | R reset | Q quit | close window = safe quit", (210, 210, 210)))
         self._put_lines(cv2, frame, lines)
 
     def _show_frame(self, cv2: Any, frame: np.ndarray) -> None:
@@ -562,6 +670,45 @@ class CameraHandWorker:
             self._window_close_notified = True
             if self.keypress_callback is not None:
                 self.keypress_callback(ord("q"))
+
+    def latest_frame(self) -> tuple[np.ndarray | None, float | None]:
+        """Detached copy of the latest annotated BGR frame, for an embedded preview."""
+
+        with self._display_lock:
+            frame = None if self._latest_display_frame is None else self._latest_display_frame.copy()
+            return frame, self._latest_display_timestamp
+
+    def show_latest(self) -> dict[str, Any]:
+        """Show the already-annotated camera frame from the main UI thread.
+
+        The worker owns one capture and one MediaPipe detector, then publishes
+        a detached display frame.  Calling this from the same thread as the
+        tri-view compositor guarantees that Windows HighGUI never has two
+        competing event loops.  It never reads the camera or invokes the hand
+        adapter, so it cannot affect robot actions.
+        """
+
+        if not self.display:
+            return {"enabled": False, "reason": "display_disabled"}
+        with self._display_lock:
+            frame = None if self._latest_display_frame is None else self._latest_display_frame.copy()
+            timestamp = self._latest_display_timestamp
+        if frame is None:
+            return {"enabled": True, "rendered": False, "reason": "no_camera_frame"}
+        try:
+            import cv2
+            self._show_frame(cv2, frame)
+            return {
+                "enabled": True,
+                "rendered": True,
+                "frame_timestamp_s": timestamp,
+                "closed": bool(self._window_close_notified),
+            }
+        except Exception as exc:
+            # Camera visualization is optional. Retaining acquisition and
+            # hand safety is preferable to stopping the robot on a GUI fault.
+            self.error = self.error or f"camera display failed: {type(exc).__name__}: {exc}"
+            return {"enabled": True, "rendered": False, "error": self.error}
 
     @staticmethod
     def _select_world_hand_index(
@@ -585,6 +732,22 @@ class CameraHandWorker:
         return 0
 
     @staticmethod
+    def _physical_handedness(label: str | None, *, detector_input_is_mirrored: bool) -> str | None:
+        """Turn MediaPipe's selfie-image handedness into a physical label."""
+
+        if label is None:
+            return None
+        value = str(label).strip()
+        if value.lower() not in {"left", "right"}:
+            return value
+        # MediaPipe documents its label as valid for mirrored / selfie input.
+        # A raw camera frame therefore needs a left-right swap before the dex
+        # right-hand gate is evaluated.
+        if detector_input_is_mirrored:
+            return value.title()
+        return "Right" if value.lower() == "left" else "Left"
+
+    @staticmethod
     def _world_landmarks_at(world_sets: Sequence[Any], selected_index: int) -> Sequence[Any] | None:
         """Return the 3-D landmark set paired with the selected 2-D hand.
 
@@ -606,7 +769,8 @@ class CameraHandWorker:
         try:
             import cv2
             import mediapipe as mp
-            capture = cv2.VideoCapture(self.camera_index)
+            capture, backend = self._open_camera_capture(cv2, self.camera_index)
+            self._capture_backend = backend
             capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             if not capture.isOpened():
@@ -627,6 +791,12 @@ class CameraHandWorker:
                 with self._status_lock:
                     self._frames_read += 1
                     self._last_frame_timestamp = timestamp
+                # MediaPipe's handedness classifier assumes a selfie-style
+                # mirrored image. Canonicalise raw Windows webcam frames by
+                # default. ``mirror_input=False`` is reserved for a driver
+                # that already supplies that same mirrored presentation.
+                if self.mirror_input:
+                    frame = cv2.flip(frame, 1)
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 rgb.flags.writeable = False
                 result = hands.process(rgb)
@@ -637,18 +807,47 @@ class CameraHandWorker:
                 for handedness_set in handedness_sets:
                     classifications = getattr(handedness_set, "classification", ())
                     label = getattr(classifications[0], "label", None) if classifications else None
-                    labels.append(str(label) if label else None)
+                    labels.append(
+                        self._physical_handedness(
+                            label,
+                            detector_input_is_mirrored=self.mirror_input,
+                        )
+                    )
                 with self._status_lock:
                     self._frames_processed += 1
                     self._detected_handedness = tuple(label for label in labels if label)
-                if landmark_sets:
+                frame_updater = getattr(self.adapter, "update_hand_frame", None)
+                if landmark_sets and callable(frame_updater):
+                    # Adapters that need both landmark sets of one detection
+                    # (camera-driven arm + fingers) receive them together.
+                    selected_index = self._select_world_hand_index(
+                        labels,
+                        expected_handedness=getattr(self.adapter, "expected_handedness", "Right"),
+                        input_is_mirrored=False,
+                    )
+                    landmarks = landmark_sets[selected_index]
+                    label = labels[selected_index] if selected_index < len(labels) else None
+                    world_landmarks = self._world_landmarks_at(
+                        getattr(result, "multi_hand_world_landmarks", None) or (), selected_index
+                    )
+                    if not label:
+                        command = self.adapter.mark_lost(timestamp, "MediaPipe handedness label unavailable")
+                    else:
+                        command = frame_updater(
+                            landmarks.landmark, world_landmarks, str(label), timestamp, frame.shape[:2],
+                            detected_hands=tuple(labels),
+                        )
+                elif landmark_sets:
                     world_updater = getattr(self.adapter, "update_world_landmarks", None)
                     selected_index = 0
                     if callable(world_updater):
                         selected_index = self._select_world_hand_index(
                             labels,
                             expected_handedness=getattr(self.adapter, "expected_handedness", "Right"),
-                            input_is_mirrored=bool(getattr(self.adapter, "input_is_mirrored", False)),
+                            # ``labels`` were normalized to physical hands
+                            # above, so selection never depends on whether a
+                            # particular camera driver mirrored its output.
+                            input_is_mirrored=False,
                         )
                     landmarks = landmark_sets[selected_index]
                     label = labels[selected_index] if selected_index < len(labels) else None
@@ -675,8 +874,11 @@ class CameraHandWorker:
                             frame, landmarks_to_draw, mp.solutions.hands.HAND_CONNECTIONS
                         )
                     hand_label = ", ".join(label for label in labels if label) or None
-                    self._draw_display(cv2, frame, command, handedness=hand_label, timestamp=timestamp)
-                    self._show_frame(cv2, frame)
+                    if self.display_text:
+                        self._draw_display(cv2, frame, command, handedness=hand_label, timestamp=timestamp)
+                    with self._display_lock:
+                        self._latest_display_frame = np.ascontiguousarray(frame.copy())
+                        self._latest_display_timestamp = timestamp
         except Exception as exc:
             if not self._stop.is_set():
                 self.error = f"camera worker failed: {type(exc).__name__}: {exc}"
@@ -689,9 +891,3 @@ class CameraHandWorker:
             with self._capture_lock:
                 if self._capture is capture:
                     self._capture = None
-            if self.display:
-                try:
-                    import cv2
-                    cv2.destroyWindow(self.window_name)
-                except Exception:
-                    pass

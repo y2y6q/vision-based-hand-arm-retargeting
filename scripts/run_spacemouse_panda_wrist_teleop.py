@@ -38,8 +38,15 @@ from wrist_teleop import (  # noqa: E402
     WristConfig,
     create_panda_osc_pose_env,
 )
+from wrist_teleop.allegro_hand_input import AllegroCurlPinchHandInput  # noqa: E402
 from wrist_teleop.allegro_model import make_allegro_panda_env  # noqa: E402
-from wrist_teleop.allegro_model import ALLEGRO_JOINT_NAMES, source_joint_specs  # noqa: E402
+from wrist_teleop.allegro_model import (  # noqa: E402
+    ALLEGRO_GEOMETRY_SCALE,
+    ALLEGRO_JOINT_NAMES,
+    ALLEGRO_PALM_DOWN_NORMAL_LOCAL,
+    ALLEGRO_PALM_VIEW_CAMERA,
+    source_joint_specs,
+)
 from wrist_teleop.dex_retargeting import DexRetargetingAdapter, DexRetargetingUnavailable  # noqa: E402
 from wrist_teleop.hand_gestures import AllegroHandGestureController  # noqa: E402
 from wrist_teleop.integrated_runtime import (  # noqa: E402
@@ -50,22 +57,46 @@ from wrist_teleop.runtime_controls import KeyboardCommandRouter  # noqa: E402
 from wrist_teleop.visualization import LaserPointer, TriViewCompositor  # noqa: E402
 from wrist_teleop.grasp_telemetry import GraspTelemetry  # noqa: E402
 from wrist_teleop.interactive_cube import InteractiveCubeScaler  # noqa: E402
+from wrist_teleop.recording import SimVideoRecorder  # noqa: E402
 
 
 _INTERACTIVE_CUBE_ENLARGE_FACTOR = 1.5
+# Keep the same reset treatment as the Panda + Shadow entry: let the hand
+# reach its safe-open target under normal MuJoCo physics, then re-latch OSC at
+# the settled end-effector pose before the viewer accepts SpaceMouse motion.
+_ALLEGRO_RESET_SETTLE_S = 0.75
 _PANDA_ALLEGRO_PALM_LASER_SITE = "palm_laser_site"
+_PANDA_ALLEGRO_PALM_VIEW_CAMERA = f"gripper0_right_{ALLEGRO_PALM_VIEW_CAMERA}"
 
 
 def _panda_allegro_palm_laser_config(config: WristConfig):
-    """Return this entry's palm-origin, world-vertical laser settings.
+    """Return the palm-centre laser, normal to the moving palm surface.
 
-    Other teleoperation entries retain their own site-local laser configuration.
+    ``palm_laser_site`` is fixed to the physical Allegro palm. With the
+    palm-down mount its local +X is the palm normal (fingers curl toward
+    +X), which points at the table in the rest pose. The ray therefore
+    rotates with the wrist in the palm frame instead of remaining fixed in
+    world coordinates.
     """
     return replace(
         config.laser,
         start_site=_PANDA_ALLEGRO_PALM_LASER_SITE,
-        direction_frame="world",
-        world_direction=(0.0, 0.0, -1.0),
+        direction_frame="site",
+        local_direction=ALLEGRO_PALM_DOWN_NORMAL_LOCAL,
+        # The palm-first-person panel looks along this ray. Hide the physical
+        # cylinder there so it cannot fill the view; TriViewCompositor draws
+        # its exact centreline aim reticle in that panel instead.
+        visible_views=("front", "side"),
+        hide_robot_in_wrist_view=True,
+    )
+
+
+def _panda_allegro_tri_view_config(config: WristConfig):
+    """Use the palm-facing first-person camera for the upper-right panel."""
+    return replace(
+        config.tri_view,
+        wrist_camera_name=_PANDA_ALLEGRO_PALM_VIEW_CAMERA,
+        wrist_fovy_deg=70.0,
     )
 
 
@@ -138,6 +169,8 @@ class _NeutralInputDevice:
 def _make_hand_input(config: WristConfig, hand_control: str):
     """Create a hand source without allowing dex to silently fall back."""
 
+    if hand_control == "curl-pinch":
+        return AllegroCurlPinchHandInput(), None
     if hand_control == "legacy-curl" or hand_control == "off":
         return HandInputAdapter(), None
     if hand_control != "dex":
@@ -149,6 +182,7 @@ def _make_hand_input(config: WristConfig, hand_control: str):
         upper_limits=[spec.upper for spec in specs],
         runtime=config.dex_hand.runtime,
         sidecar_python=config.dex_hand.sidecar_python,
+        reference_landmark_scale=ALLEGRO_GEOMETRY_SCALE,
     )
     return DexHandInputAdapter(
         retargeter,
@@ -158,6 +192,8 @@ def _make_hand_input(config: WristConfig, hand_control: str):
         stale_timeout_s=config.dex_hand.stale_timeout_s,
         expected_handedness=config.dex_hand.expected_handedness,
         input_is_mirrored=config.dex_hand.input_is_mirrored,
+        relative_motion=config.dex_hand.relative_motion,
+        relative_motion_gain=config.dex_hand.relative_motion_gain,
     ), retargeter
 
 
@@ -290,9 +326,11 @@ def run_integrated(
     camera_index: int,
     camera_display: bool,
     *,
-    hand_control: str = "dex",
+    camera_mirror: bool = True,
+    hand_control: str = "curl-pinch",
     synthetic_input: bool = False,
     three_view: bool = False,
+    record_path: Path | None = None,
 ) -> int:
     """Run independent SpaceMouse wrist and camera-Allegro hand sources.
 
@@ -308,9 +346,12 @@ def run_integrated(
     hand_input: Any = None
     retargeter: DexRetargetingAdapter | None = None
     keyboard = KeyboardCommandRouter()
-    use_three_view = bool(three_view and config.tri_view.enabled)
+    tri_view_config = _panda_allegro_tri_view_config(config)
+    use_three_view = bool(three_view and tri_view_config.enabled)
     cube_resize_lock = threading.Lock()
     cube_resize_source: str | None = None
+    dex_recenter_lock = threading.Lock()
+    dex_recenter_source: str | None = None
     # The camera worker only reads this snapshot to annotate the already-open
     # capture.  It never owns or writes simulator / hand actions.
     camera_ui_lock = threading.Lock()
@@ -330,8 +371,8 @@ def run_integrated(
             camera_ui_state["active_override"] = active_override
 
     def route_key(key: int, *, source: str) -> None:
-        """Keep R/Q semantics and queue B without blocking a GUI callback."""
-        nonlocal cube_resize_source
+        """Keep keyboard requests out of GUI callbacks until the control tick."""
+        nonlocal cube_resize_source, dex_recenter_source
         keyboard.feed(key, source=source)
         normalized = chr(key).lower() if isinstance(key, int) and 0 <= key <= 255 else ""
         if normalized == "b":
@@ -340,6 +381,10 @@ def run_integrated(
                 # the model-side operation is idempotent after enlargement.
                 if cube_resize_source is None:
                     cube_resize_source = source
+        if normalized == "c":
+            with dex_recenter_lock:
+                if dex_recenter_source is None:
+                    dex_recenter_source = source
 
     def take_cube_resize_source() -> str | None:
         nonlocal cube_resize_source
@@ -352,6 +397,12 @@ def run_integrated(
         with cube_resize_lock:
             cube_resize_source = None
 
+    def take_dex_recenter_source() -> str | None:
+        nonlocal dex_recenter_source
+        with dex_recenter_lock:
+            source, dex_recenter_source = dex_recenter_source, None
+            return source
+
     def route_camera_key(key: int) -> None:
         route_key(key, source="camera")
 
@@ -360,6 +411,32 @@ def run_integrated(
 
     def route_tri_view_key(key: int) -> None:
         route_key(key, source="tri_view")
+
+    def create_tri_view() -> tuple[LaserPointer | None, TriViewCompositor | None, dict[str, Any]]:
+        """Create the same palm-view / camera-frame bundle used by Shadow.
+
+        Keeping creation in one helper prevents the startup and R-reset paths
+        from drifting into different camera bases or laser ownership states.
+        The only model-specific part is the already-verified Allegro palm site
+        and palm camera selected by ``laser_config`` and ``tri_view_config``.
+        """
+        if not use_three_view:
+            return None, None, {"laser": {"enabled": False, "reason": "three_view_disabled"}}
+        assert env is not None
+        next_laser = LaserPointer(env, laser_config)
+        next_tri_view = TriViewCompositor(
+            tri_view_config,
+            show_window=True,
+            key_handler=route_tri_view_key,
+            on_close=lambda: keyboard.feed("q", source="tri_view_window"),
+            laser=next_laser,
+        )
+        next_tri_view.configure_cameras(env)
+        next_control_frame = mapper.set_camera_from_sim(env, tri_view_config.front_camera_name)
+        return next_laser, next_tri_view, {
+            "laser": next_laser.update(),
+            "control_frame": next_control_frame,
+        }
 
     camera: Any = _NullCamera()
     env = None
@@ -370,6 +447,7 @@ def run_integrated(
     tri_view_snapshot: Path | None = None
     grasp: GraspTelemetry | None = None
     cube_scaler: InteractiveCubeScaler | None = None
+    recorder = SimVideoRecorder(record_path, fps=config.control_hz)
     laser_config = _panda_allegro_palm_laser_config(config)
     reason = "completed"
     exit_code = 0
@@ -382,6 +460,8 @@ def run_integrated(
             "timestamp_monotonic_s": time.monotonic(),
             "legacy_curl_fallback_allowed": False,
         })
+        if hand_control == "dex":
+            print("Preparing official dex-retargeting (a cold Windows start can take up to 90 seconds)...")
         hand_input, retargeter = _make_hand_input(config, hand_control)
         if retargeter is not None:
             # Record the native solver identity before HID / camera startup so
@@ -404,6 +484,7 @@ def run_integrated(
                 hand_input,
                 camera_index=camera_index,
                 display=camera_display,
+                mirror_input=camera_mirror,
                 keypress_callback=route_camera_key,
                 status_provider=camera_ui_status,
             )
@@ -413,7 +494,9 @@ def run_integrated(
             # Keeping robosuite's native viewer disabled prevents two GUI event
             # loops from competing for R/Q and for renderer ownership.
             has_renderer=not headless and not use_three_view,
-            has_offscreen_renderer=bool(use_three_view and not headless),
+            has_offscreen_renderer=bool(use_three_view or record_path is not None),
+            # Palm parallel to the table at rest, as in the Shadow entry.
+            palm_down=True,
         )
         info = device.open()
         composer, gestures, reset_hand, reset_action = reset_integrated_environment(
@@ -425,32 +508,25 @@ def run_integrated(
             gesture_config=config.hand_gestures,
             buttons=last_buttons,
             keypress_callback=None if headless or use_three_view else route_mujoco_key,
+            settle_duration_s=_ALLEGRO_RESET_SETTLE_S,
         )
         update_camera_ui_status(
             source=reset_hand.source,
             active_override=reset_hand.active_override,
         )
         cube_scaler = InteractiveCubeScaler(env, factor=_INTERACTIVE_CUBE_ENLARGE_FACTOR)
-        if use_three_view:
-            laser = LaserPointer(env, laser_config)
-            tri_view = TriViewCompositor(
-                config.tri_view,
-                show_window=True,
-                key_handler=route_tri_view_key,
-                on_close=lambda: keyboard.feed("q", source="tri_view_window"),
-                laser=laser,
-            )
-            tri_view.configure_cameras(env)
-            control_frame = mapper.set_camera_from_sim(env, config.tri_view.front_camera_name)
-            initial_laser = laser.update()
-        else:
-            initial_laser = {"enabled": False, "reason": "three_view_disabled"}
+        laser, tri_view, visual_initial = create_tri_view()
+        if visual_initial.get("control_frame") is not None:
+            control_frame = visual_initial["control_frame"]
+        initial_laser = visual_initial["laser"]
         grasp = GraspTelemetry(env, config.grasp_telemetry)
         if hand_control != "off":
             camera.start()
         if retargeter is None:
             if hand_control == "legacy-curl":
                 print("hand mode=legacy-curl (selected explicitly; dex is not active)")
+            elif hand_control == "curl-pinch":
+                print("hand mode=curl-pinch (Shadow-style finger curl + thumb pinch opposition)")
             else:
                 print("hand mode=off (safe-open; camera retargeting is disabled)")
         log.metadata({
@@ -460,6 +536,7 @@ def run_integrated(
             "three_view": use_three_view,
             "camera_index": camera_index,
             "camera_display": camera_display,
+            "camera_mirror": camera_mirror,
             "config": config.to_dict(),
             "device": info,
             "osc_pose_and_allegro": composer.describe(),
@@ -467,6 +544,7 @@ def run_integrated(
             "camera_hand_input": {
                 "algorithm": (
                     "official dex-retargeting vector mapping" if hand_control == "dex"
+                    else "MediaPipe landmarks + Shadow-style curl and thumb pinch opposition" if hand_control == "curl-pinch"
                     else "MediaPipe landmarks + legacy rule-based finger curl mapping" if hand_control == "legacy-curl"
                     else "safe-open/off"
                 ),
@@ -485,6 +563,7 @@ def run_integrated(
                 "reset": "R/r queues one complete environment reset",
                 "quit": "Q/q queues safe shutdown with a final zero wrist delta",
                 "cube_enlarge": "B/b enlarges the interactive Lift cube once to 1.5x; R restores its default size",
+                "dex_recentre": "C/c makes the current valid right-hand dex target the relative neutral pose",
                 "sources": (
                     (["synchronized tri-view OpenCV window"] if use_three_view else ["MuJoCo viewer"])
                     + (["Panda + Allegro camera OpenCV window"] if camera_display and hand_control != "off" else [])
@@ -492,7 +571,7 @@ def run_integrated(
             },
             "visualization": {
                 "three_view": use_three_view,
-                "tri_view_config": config.tri_view.__dict__,
+                "tri_view_config": tri_view_config.__dict__,
                 "laser_config": laser_config.__dict__,
                 "initial_laser": initial_laser,
             },
@@ -501,6 +580,7 @@ def run_integrated(
                 "restore_key": "R/r",
                 "state": cube_scaler.status(),
             },
+            "recording": recorder.summary(),
             "grasp_telemetry": {
                 "config": config.grasp_telemetry.to_dict(),
                 "initial": grasp.update(),
@@ -512,7 +592,7 @@ def run_integrated(
         )
         print(
             "B enlarges the interactive Lift cube once to 1.5x; R restores its default size and resets the environment; "
-            "Q and Ctrl+C safely exit. Configured SpaceMouse buttons toggle Allegro gestures."
+            "C re-centres the current dex hand pose; Q and Ctrl+C safely exit. Configured SpaceMouse buttons toggle Allegro gestures."
         )
         log.event({
             "event": "environment_reset",
@@ -552,21 +632,12 @@ def run_integrated(
                     gestures=gestures,
                     buttons=last_buttons,
                     keypress_callback=None if headless or use_three_view else route_mujoco_key,
+                    settle_duration_s=_ALLEGRO_RESET_SETTLE_S,
                 )
-                if use_three_view:
-                    laser = LaserPointer(env, laser_config)
-                    tri_view = TriViewCompositor(
-                        config.tri_view,
-                        show_window=True,
-                        key_handler=route_tri_view_key,
-                        on_close=lambda: keyboard.feed("q", source="tri_view_window"),
-                        laser=laser,
-                    )
-                    tri_view.configure_cameras(env)
-                    control_frame = mapper.set_camera_from_sim(env, config.tri_view.front_camera_name)
-                    reset_laser = laser.update()
-                else:
-                    reset_laser = {"enabled": False, "reason": "three_view_disabled"}
+                laser, tri_view, visual_reset = create_tri_view()
+                if visual_reset.get("control_frame") is not None:
+                    control_frame = visual_reset["control_frame"]
+                reset_laser = visual_reset["laser"]
                 grasp = GraspTelemetry(env, config.grasp_telemetry)
                 cube_scaler = InteractiveCubeScaler(env, factor=_INTERACTIVE_CUBE_ENLARGE_FACTOR)
                 log.event({
@@ -577,6 +648,7 @@ def run_integrated(
                     "hand_source": reset_hand.source,
                     "active_override": reset_hand.active_override,
                     "laser": reset_laser,
+                    "visualization": visual_reset,
                     "control_frame": control_frame,
                     "grasp": grasp.update(),
                     "cube_before_reset": cube_before_reset,
@@ -612,6 +684,17 @@ def run_integrated(
                             else str(cube_event.get("reason"))
                         )
                     )
+            dex_recenter_request = take_dex_recenter_source()
+            if dex_recenter_request is not None:
+                recenter = getattr(hand_input, "recenter_relative_motion", None)
+                changed = bool(callable(recenter) and recenter())
+                log.event({
+                    "event": "dex_relative_recenter",
+                    "timestamp_monotonic_s": time.monotonic(),
+                    "source": dex_recenter_request,
+                    "changed": changed,
+                })
+                print("dex_relative_recenter: " + ("applied" if changed else "waiting_for_valid_right_hand"))
             cycle_start = time.monotonic()
             sample = device.poll()
             last_buttons = sample.buttons if sample.buttons_valid else (False,) * len(sample.buttons)
@@ -629,6 +712,7 @@ def run_integrated(
             )
             action = composer.compose(wrist_command, gesture_command.joint_targets)
             observation, reward, done, info = env.step(action)
+            recorder.capture(env)
             grasp_event = grasp.update() if grasp is not None else {"available": False, "reason": "not_initialized"}
             laser_event = laser.update() if laser is not None else {"enabled": False}
             tri_view_event = (
@@ -642,6 +726,13 @@ def run_integrated(
                 )
                 if tri_view is not None
                 else {"enabled": False}
+            )
+            # HighGUI display is deliberately serviced here, beside tri-view,
+            # rather than inside the camera worker thread.
+            camera_display_event = (
+                camera.show_latest()
+                if camera_display and hasattr(camera, "show_latest")
+                else {"enabled": False, "reason": "headless_or_unavailable"}
             )
             if (
                 tri_view is not None
@@ -674,6 +765,7 @@ def run_integrated(
                     "error": hand_command.error or camera.error,
                     "worker_running": camera.running,
                     "worker_status": camera.status() if hasattr(camera, "status") else None,
+                    "display": camera_display_event,
                     "details": hand_command.details,
                 },
                 hand_source=gesture_command.source,
@@ -692,6 +784,7 @@ def run_integrated(
                 visualization={"laser": laser_event, "tri_view": tri_view_event},
                 cube_scale_factor=(cube_scaler.status().get("current_factor") if cube_scaler is not None else None),
                 grasp=grasp_event,
+                recording=recorder.summary() if recorder.frame_count == 1 else None,
                 loop_seconds=time.monotonic() - cycle_start,
             )
             log.event(event)
@@ -713,6 +806,12 @@ def run_integrated(
                         "timestamp_monotonic_s": time.monotonic(),
                         "grasp": grasp.summary(),
                     })
+                recorder.close()
+                log.event({
+                    "event": "recording_summary",
+                    "timestamp_monotonic_s": time.monotonic(),
+                    "recording": recorder.summary(),
+                })
                 if tri_view is not None:
                     tri_view.close()
                 if laser is not None:
@@ -755,13 +854,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=ROOT / "configs" / "spacemouse_wrist.json")
     parser.add_argument("--headless", action="store_true", help="teleop / integrated: no MuJoCo or camera viewer")
     parser.add_argument("--duration", type=float, default=None, help="optional bounded run for smoke tests")
+    parser.add_argument("--record", type=Path, default=None, help="integrated only: optional front-view MP4 path; PNG frames are used if the codec is unavailable")
     parser.add_argument("--camera-index", type=int, default=0, help="integrated only: OpenCV camera index")
     parser.add_argument("--no-camera-display", action="store_true", help="integrated only: hide the camera status window")
     parser.add_argument(
+        "--camera-no-mirror",
+        action="store_true",
+        help="integrated only: use only when the camera driver already mirrors its image",
+    )
+    parser.add_argument(
         "--hand-control",
-        choices=("dex", "legacy-curl", "off"),
-        default="dex",
-        help="integrated only: official dex (default), explicit legacy curl, or safe-open/off",
+        choices=("curl-pinch", "dex", "legacy-curl", "off"),
+        default=None,
+        help="integrated only: Shadow-style curl-pinch (default), official dex, legacy curl, or safe-open/off",
     )
     parser.add_argument(
         "--no-three-view",
@@ -786,18 +891,20 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.duration is not None and args.duration <= 0:
         parser.error("--duration must be positive")
-    if args.mode == "diagnostic" and (args.headless or args.no_camera_display or args.camera_index != 0):
+    if args.mode == "diagnostic" and (args.headless or args.no_camera_display or args.camera_index != 0 or args.camera_no_mirror):
         parser.error("camera and --headless options do not apply to diagnostic")
-    if args.mode == "teleop" and (args.no_camera_display or args.camera_index != 0):
+    if args.mode == "teleop" and (args.no_camera_display or args.camera_index != 0 or args.camera_no_mirror):
         parser.error("camera options apply only to integrated")
     if args.mode != "integrated" and (
-        args.hand_control != "dex" or args.no_three_view or args.viewer_smoke or args.headless_smoke or args.dex_smoke
+        args.hand_control is not None or args.no_three_view or args.viewer_smoke or args.headless_smoke or args.dex_smoke or args.record is not None
     ):
         parser.error("--hand-control, --no-three-view, --viewer-smoke, --headless-smoke, and --dex-smoke apply only to integrated")
     if args.viewer_smoke and args.headless:
         parser.error("--viewer-smoke requires a visible tri-view window; use --headless-smoke with --headless")
     if args.headless_smoke and not args.headless:
         parser.error("--headless-smoke requires --headless")
+    if args.hand_control is None and not args.dex_smoke:
+        args.hand_control = "curl-pinch"
     if sum(bool(value) for value in (args.viewer_smoke, args.headless_smoke, args.dex_smoke)) > 1:
         parser.error("choose only one of --viewer-smoke, --headless-smoke, or --dex-smoke")
     if args.viewer_smoke:
@@ -811,8 +918,9 @@ def parse_args() -> argparse.Namespace:
     if args.dex_smoke:
         if not args.headless:
             parser.error("--dex-smoke requires --headless")
-        if args.hand_control != "dex":
+        if args.hand_control not in (None, "dex"):
             parser.error("--dex-smoke requires --hand-control dex")
+        args.hand_control = "dex"
         if args.duration is None:
             args.duration = 2.0
     return args
@@ -828,9 +936,11 @@ def main() -> int:
         return run_integrated(
             config, args.headless, args.duration, args.camera_index,
             camera_display=not args.headless and not args.no_camera_display,
+            camera_mirror=not args.camera_no_mirror,
             hand_control=args.hand_control,
             synthetic_input=args.viewer_smoke or args.headless_smoke or args.dex_smoke,
             three_view=use_three_view,
+            record_path=args.record,
         )
     return run_teleop(config, args.headless, args.duration)
 

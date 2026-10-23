@@ -1,15 +1,15 @@
 """Shared one-degree-of-freedom gripper teleoperation for robosuite.
 
-The module deliberately keeps Panda's parallel gripper and Jaco's official
-three-finger gripper on the same control path.  It discovers the installed
+The module deliberately keeps Panda's parallel grippers and the official
+Jaco / Robotiq three-finger grippers on the same control path. It discovers the installed
 OSC and policy-gripper action slices from the live composite controller rather
 than assuming either layout is ``[0:6] + [6]``.
 
 Interactive runs use the existing SpaceMouse HID reader and six-axis mapper.
-The two SpaceMouse buttons are a small, separate state machine: a rising edge
-on the configured left button requests close, and one on the right requests
-open.  Invalid / disconnected HID packets fail closed to a zero wrist delta
-and zero gripper command.
+For two-finger grippers, the two SpaceMouse buttons select open / close on a
+rising edge. For three-finger grippers they are level-triggered: hold left to
+close and hold right to open. Invalid / disconnected HID packets fail closed
+to a zero wrist delta and zero gripper command.
 """
 
 from __future__ import annotations
@@ -29,30 +29,84 @@ from .config import WristConfig
 from .device import MotionSample, SpaceMouseHid
 from .grasp_telemetry import GraspTelemetry
 from .mapper import SixDofMapper
+from .osc import DesiredGoalGuard
+from .interactive_cube import InteractiveCubeScaler
+from .recording import SimVideoRecorder
 from .runtime_controls import KeyboardCommandRouter, install_viewer_key_callback
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
+# Three-finger grippers consume a normalized velocity policy command.  The
+# Panda + Robotiq and Jaco both reach the legal full-close / full-open command
+# in 0.10 s at 20 Hz.  Neither setting exceeds the official action range;
+# MuJoCo joint limits and the installed controller remain authoritative.
+THREE_FINGER_GRIPPER_POLICY_TARGET_RATE_PER_S = 3.0
+ROBOTIQ_THREE_FINGER_GRIPPER_POLICY_TARGET_RATE_PER_S = 12.0
+JACO_GRIPPER_POLICY_TARGET_RATE_PER_S = 12.0
+# robosuite's JacoThreeFingerGripper.format_action runs once per policy step,
+# uses only sign(action), and moves its finger target by a fixed 0.01: a full
+# -1 -> +1 sweep takes 200 steps (10 s at 20 Hz).  The Jaco entry raises that
+# per-step travel and makes it follow the command magnitude, so a held button
+# sweeps fully in about 0.7 s and the button ramp still eases the start.
+JACO_GRIPPER_TARGET_SPEED_PER_STEP = 0.15
+
+# Default configurations retained for the two original launchers.
 ROBOT_GRIPPER_EXPECTATIONS = {
     "Panda": "PandaGripper",
     "Jaco": "JacoThreeFingerGripper",
 }
 
-# Jaco's installed robosuite ``SimpleGripController`` consumes a normalized
-# velocity command.  This is deliberately a module-level, named project
-# setting rather than a magic number in the live loop.  The matching Jaco
-# button controller integrates a bounded policy target with the *measured*
-# control-loop interval, then emits that target only while a button remains
-# pressed.  It therefore has identical movement per elapsed second at
-# different render / OS scheduling rates.
-JACO_GRIPPER_POLICY_TARGET_RATE_PER_S = 1.5
 
+@dataclass(frozen=True)
+class GripperTeleopSpec:
+    """One tested robosuite robot / official one-DoF gripper pairing."""
+
+    robot: str
+    gripper_type: str
+    fingers: int
+    continuous_buttons: bool
+    continuous_rate_per_s: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.continuous_buttons:
+            if self.continuous_rate_per_s is None or not np.isfinite(self.continuous_rate_per_s):
+                raise ValueError("continuous three-finger grippers require a finite button rate")
+            if self.continuous_rate_per_s <= 0.0:
+                raise ValueError("continuous three-finger gripper button rate must be positive")
+        elif self.continuous_rate_per_s is not None:
+            raise ValueError("edge-triggered grippers must not define a continuous button rate")
+
+
+GRIPPER_TELEOP_SPECS: tuple[GripperTeleopSpec, ...] = (
+    GripperTeleopSpec("Panda", "PandaGripper", fingers=2, continuous_buttons=False),
+    GripperTeleopSpec("Panda", "Robotiq85Gripper", fingers=2, continuous_buttons=False),
+    GripperTeleopSpec(
+        "Jaco", "JacoThreeFingerGripper", fingers=3, continuous_buttons=True,
+        continuous_rate_per_s=JACO_GRIPPER_POLICY_TARGET_RATE_PER_S,
+    ),
+    GripperTeleopSpec(
+        "Panda", "RobotiqThreeFingerGripper", fingers=3, continuous_buttons=True,
+        continuous_rate_per_s=ROBOTIQ_THREE_FINGER_GRIPPER_POLICY_TARGET_RATE_PER_S,
+    ),
+)
+
+
+def resolve_gripper_spec(robot: str, gripper_type: str | None = None) -> GripperTeleopSpec:
+    """Resolve only a pair exercised against the installed robosuite API."""
+
+    expected = gripper_type or ROBOT_GRIPPER_EXPECTATIONS.get(robot)
+    for spec in GRIPPER_TELEOP_SPECS:
+        if spec.robot == robot and spec.gripper_type == expected:
+            return spec
+    supported = ", ".join(f"{item.robot}+{item.gripper_type}" for item in GRIPPER_TELEOP_SPECS)
+    raise ValueError(f"Unsupported one-DoF gripper pair {robot}+{expected}; supported: {supported}")
 
 def create_gripper_osc_pose_env(
     config: WristConfig,
     *,
     robot: str,
+    gripper_type: str | None = None,
     has_renderer: bool,
     has_offscreen_renderer: bool = False,
 ):
@@ -64,8 +118,7 @@ def create_gripper_osc_pose_env(
     limits.
     """
 
-    if robot not in ROBOT_GRIPPER_EXPECTATIONS:
-        raise ValueError(f"Unsupported one-DoF gripper robot: {robot!r}")
+    spec = resolve_gripper_spec(robot, gripper_type)
 
     import robosuite as suite
     from robosuite.controllers.composite.composite_controller_factory import (
@@ -89,6 +142,7 @@ def create_gripper_osc_pose_env(
     return suite.make(
         "Lift",
         robots=robot,
+        gripper_types=spec.gripper_type,
         controller_configs=controller_config,
         has_renderer=has_renderer,
         has_offscreen_renderer=has_offscreen_renderer,
@@ -160,6 +214,7 @@ class OneDofGripperComposer:
         if self.arm_slice.stop - self.arm_slice.start != 6:
             raise RuntimeError("installed OSC action slice is not six-dimensional")
         self.controller = self.robot.part_controllers[self.arm_part]
+        self.goal_guard = DesiredGoalGuard(self.controller)
         if (
             getattr(self.controller, "input_type", None) != "delta"
             or getattr(self.controller, "input_ref_frame", None) != "world"
@@ -207,6 +262,7 @@ class OneDofGripperComposer:
         """Latch the current end-effector pose to prevent a startup jump."""
 
         self.controller.reset_goal(goal_update_mode="desired")
+        self.goal_guard.reset()
 
     def neutral_action(self) -> np.ndarray:
         """The robosuite no-op: zero OSC delta and zero / hold gripper action."""
@@ -247,6 +303,7 @@ class OneDofGripperComposer:
         ):
             raise RuntimeError("OSC_POSE has invalid action scaling limits")
         clipped_delta = np.clip(delta, output_min, output_max)
+        self.goal_guard.before_step(clipped_delta)
         normalized = input_min + (clipped_delta - output_min) * (
             input_max - input_min
         ) / (output_max - output_min)
@@ -391,8 +448,8 @@ class GripperButtonController:
         return GripperCommand(self._command, self._state, edges)
 
 
-class JacoContinuousGripperButtonController(GripperButtonController):
-    """Level-triggered, rate-limited Jaco three-finger gripper control.
+class ThreeFingerContinuousGripperButtonController(GripperButtonController):
+    """Level-triggered, rate-limited official three-finger gripper control.
 
     robosuite's installed :class:`SimpleGripController` interprets its one
     policy degree of freedom as a velocity, so sending a stale nonzero action
@@ -417,11 +474,11 @@ class JacoContinuousGripperButtonController(GripperButtonController):
         *,
         open_command: float,
         close_command: float,
-        rate_per_s: float = JACO_GRIPPER_POLICY_TARGET_RATE_PER_S,
+        rate_per_s: float = THREE_FINGER_GRIPPER_POLICY_TARGET_RATE_PER_S,
     ):
         super().__init__(config, open_command=open_command, close_command=close_command)
         if not np.isfinite(rate_per_s) or rate_per_s <= 0.0:
-            raise ValueError("Jaco gripper rate_per_s must be finite and positive")
+            raise ValueError("three-finger gripper rate_per_s must be finite and positive")
         self.rate_per_s = float(rate_per_s)
         self._target = 0.0
         self._last_direction = 0
@@ -523,7 +580,7 @@ class JacoContinuousGripperButtonController(GripperButtonController):
         return GripperCommand(command, self._state, edges)
 
     def describe(self) -> dict[str, Any]:
-        """Document the Jaco-specific level-triggered semantics in metadata."""
+        """Document the level-triggered semantics in metadata."""
 
         return {
             "mode": "level_triggered_continuous",
@@ -536,6 +593,12 @@ class JacoContinuousGripperButtonController(GripperButtonController):
             "simultaneous_behavior": "zero gripper velocity; no target integration",
             "invalid_hid_behavior": "zero wrist delta and zero gripper velocity",
         }
+
+
+# Backward-compatible name for local scripts and prior run logs. The same
+# state machine is intentionally shared by Jaco and Robotiq three-finger
+# grippers rather than being a Jaco-only special case.
+JacoContinuousGripperButtonController = ThreeFingerContinuousGripperButtonController
 
 
 def _json_default(value: Any) -> Any:
@@ -577,9 +640,9 @@ class _ViewerSmokeInput:
     verify the same button state machine without claiming a hardware test.
     """
 
-    def __init__(self, config: WristConfig, *, robot: str):
+    def __init__(self, config: WristConfig, *, continuous_buttons: bool):
         self.config = config
-        self.robot = robot
+        self.continuous_buttons = bool(continuous_buttons)
         self._opened_at: float | None = None
         self._poll_count = 0
         self.closed = False
@@ -600,10 +663,11 @@ class _ViewerSmokeInput:
         # Use control-loop counts rather than wall time. Creating the native
         # MuJoCo viewer can briefly block the first simulation update, and a
         # wall-clock schedule could otherwise skip both smoke-test inputs.
-        # Jaco deliberately receives two level-held ranges so its smoke log
+        # Three-finger grippers deliberately receive two level-held ranges so
+        # their smoke log
         # exercises continuous close, release / exact hold, and continuous
         # open. Panda retains its established edge-only pulse sequence.
-        if self.robot == "Jaco":
+        if self.continuous_buttons:
             close_pressed = 2 <= self._poll_count <= 14
             open_pressed = 19 <= self._poll_count <= 31
         else:
@@ -726,6 +790,49 @@ class _OptionalVisualAssistance:
                     pass
 
 
+_FAST_JACO_CLASSES: dict[type, type] = {}
+
+
+def apply_jaco_gripper_speed(env: Any, speed_per_step: float = JACO_GRIPPER_TARGET_SPEED_PER_STEP) -> int:
+    """Give every live JacoThreeFingerGripper a faster, magnitude-aware sweep.
+
+    The installed class is swapped for a subclass on this instance only; the
+    installed package is never edited. Call after every ``env.reset()``
+    because robosuite's hard reset rebuilds the gripper objects.
+    """
+
+    if not np.isfinite(speed_per_step) or not 0.0 < float(speed_per_step) <= 1.0:
+        raise ValueError("Jaco gripper speed must be in (0, 1] per policy step")
+    patched = 0
+    for robot in getattr(env, "robots", ()):
+        grippers = getattr(robot, "gripper", {})
+        for gripper in (grippers.values() if isinstance(grippers, dict) else (grippers,)):
+            base = type(gripper)
+            if getattr(base, "_project_fast_jaco", False):
+                base = base.__mro__[1]
+            elif base.__name__ != "JacoThreeFingerGripper":
+                continue
+            fast = _FAST_JACO_CLASSES.get(base)
+            if fast is None:
+                def format_action(self: Any, action: Any) -> np.ndarray:
+                    assert len(action) == self.dof
+                    command = float(np.clip(np.asarray(action, dtype=np.float64).reshape(-1)[0], -1.0, 1.0))
+                    # Same sign convention as the installed class.
+                    self.current_action = np.clip(self.current_action - self.speed * command, -1.0, 1.0)
+                    return self.current_action * np.array([1, 1, 1])
+
+                fast = type(base.__name__, (base,), {  # keep the name entry checks expect
+                    "_project_fast_jaco": True,
+                    "format_action": format_action,
+                    "speed": property(lambda self: self._project_speed),
+                })
+                _FAST_JACO_CLASSES[base] = fast
+            gripper.__class__ = fast
+            gripper._project_speed = float(speed_per_step)
+            patched += 1
+    return patched
+
+
 def reset_gripper_environment(
     env: Any,
     *,
@@ -737,6 +844,7 @@ def reset_gripper_environment(
     """Implement one complete R-key reset while retaining the HID handle."""
 
     env.reset()
+    apply_jaco_gripper_speed(env)
     mapper.reset()
     reset_input = getattr(device, "reset_input_state", None)
     if callable(reset_input):
@@ -804,14 +912,18 @@ def _sleep_to_rate(cycle_start: float, control_hz: float) -> None:
 def run_gripper_teleop(
     *,
     robot: str,
+    gripper_type: str | None = None,
     config: WristConfig,
     headless: bool,
     duration_s: float | None,
     viewer_smoke: bool = False,
     headless_smoke: bool = False,
     enable_three_view: bool = True,
+    cube_enlarge_factor: float = 1.5,
+    record_path: Path | None = None,
+    three_finger_rate_per_s: float | None = None,
 ) -> int:
-    """Run the sole generic loop for Panda and Jaco one-DoF grippers.
+    """Run the shared loop for the project's tested one-DoF configurations.
 
     Normal runs require a real SpaceMouse.  ``viewer_smoke`` intentionally
     substitutes bounded synthetic zero motion plus one close/open button
@@ -826,26 +938,50 @@ def run_gripper_teleop(
         raise ValueError("choose either viewer_smoke or headless_smoke")
     if duration_s is not None and duration_s <= 0.0:
         raise ValueError("duration_s must be positive")
+    if not np.isfinite(cube_enlarge_factor) or cube_enlarge_factor <= 1.0:
+        raise ValueError("cube_enlarge_factor must be finite and greater than one")
 
-    log = GripperRunLog(robot)
+    spec = resolve_gripper_spec(robot, gripper_type)
+    if three_finger_rate_per_s is not None:
+        if not spec.continuous_buttons:
+            raise ValueError("three_finger_rate_per_s applies only to continuous three-finger grippers")
+        if not np.isfinite(three_finger_rate_per_s) or three_finger_rate_per_s <= 0.0:
+            raise ValueError("three_finger_rate_per_s must be finite and positive")
+    active_three_finger_rate = (
+        float(three_finger_rate_per_s)
+        if three_finger_rate_per_s is not None
+        else spec.continuous_rate_per_s
+    )
+    run_label = f"{spec.robot}_{spec.gripper_type}".replace("Gripper", "").lower()
+    log = GripperRunLog(run_label)
     mapper = SixDofMapper(config)
     synthetic_smoke = bool(viewer_smoke or headless_smoke)
-    device: Any = _ViewerSmokeInput(config, robot=robot) if synthetic_smoke else SpaceMouseHid(config)
+    device: Any = (
+        _ViewerSmokeInput(config, continuous_buttons=spec.continuous_buttons)
+        if synthetic_smoke
+        else SpaceMouseHid(config)
+    )
     keyboard = KeyboardCommandRouter()
     env = None
     composer: OneDofGripperComposer | None = None
     buttons: GripperButtonController | None = None
     visual: _OptionalVisualAssistance | None = None
+    cube: InteractiveCubeScaler | None = None
+    recorder = SimVideoRecorder(record_path, fps=config.control_hz)
     visual_snapshot: Path | None = None
     grasp: GraspTelemetry | None = None
     control_frame: dict[str, Any] = mapper.describe_control_frame()
     reason = "completed"
     exit_code = 0
+    cube_resize_requested = False
     if synthetic_smoke and duration_s is None:
         duration_s = 2.5
 
     def route_viewer_key(key: int) -> None:
+        nonlocal cube_resize_requested
         keyboard.feed(key, source="mujoco")
+        if isinstance(key, int) and 0 <= key <= 255 and chr(key).lower() == "b":
+            cube_resize_requested = True
 
     try:
         wants_tri_view = bool(
@@ -855,11 +991,12 @@ def run_gripper_teleop(
         )
         env = create_gripper_osc_pose_env(
             config,
-            robot=robot,
+            robot=spec.robot,
+            gripper_type=spec.gripper_type,
             # The compositor owns the only visible window when enabled.
             # Avoid creating a competing native MuJoCo viewer in that case.
             has_renderer=not headless and not wants_tri_view,
-            has_offscreen_renderer=wants_tri_view,
+            has_offscreen_renderer=wants_tri_view or record_path is not None,
         )
         device_info = device.open()
         # Build a temporary composer only to obtain verified live action
@@ -867,12 +1004,13 @@ def run_gripper_teleop(
         env.reset()
         probe = OneDofGripperComposer(env)
         buttons = (
-            JacoContinuousGripperButtonController(
+            ThreeFingerContinuousGripperButtonController(
                 config,
                 open_command=probe.gripper_low,
                 close_command=probe.gripper_high,
+                rate_per_s=float(active_three_finger_rate),
             )
-            if robot == "Jaco"
+            if spec.continuous_buttons
             else GripperButtonController(
                 config,
                 open_command=probe.gripper_low,
@@ -886,11 +1024,12 @@ def run_gripper_teleop(
             buttons=buttons,
             keypress_callback=None if headless or wants_tri_view else route_viewer_key,
         )
-        expected_gripper = ROBOT_GRIPPER_EXPECTATIONS[robot]
+        expected_gripper = spec.gripper_type
         if composer.gripper.__class__.__name__ != expected_gripper:
             raise RuntimeError(
-                f"{robot} loaded {composer.gripper.__class__.__name__}, expected {expected_gripper}"
+                f"{spec.robot} loaded {composer.gripper.__class__.__name__}, expected {expected_gripper}"
             )
+        cube = InteractiveCubeScaler(env, factor=cube_enlarge_factor)
         visual = _OptionalVisualAssistance.create(
             env,
             config,
@@ -902,7 +1041,9 @@ def run_gripper_teleop(
         log.metadata(
             {
                 "mode": "one_dof_gripper_teleop",
-                "robot": robot,
+                "robot": spec.robot,
+                "gripper_type": spec.gripper_type,
+                "finger_count": spec.fingers,
                 "headless": headless,
                 "viewer_smoke": viewer_smoke,
                 "headless_smoke": headless_smoke,
@@ -912,7 +1053,7 @@ def run_gripper_teleop(
                 "control_frame": control_frame,
                 "button_semantics": (
                     buttons.describe()
-                    if isinstance(buttons, JacoContinuousGripperButtonController)
+                    if isinstance(buttons, ThreeFingerContinuousGripperButtonController)
                     else {
                         "mode": "rising_edge_selected_command",
                         "left_button_index": buttons.left_button_index,
@@ -923,11 +1064,14 @@ def run_gripper_teleop(
                         "invalid_hid_behavior": "zero wrist delta and zero gripper hold command",
                     }
                 ),
+                "three_finger_rate_override_policy_units_per_s": three_finger_rate_per_s,
                 "keyboard": {
                     "reset": "R/r resets environment, OSC goal, mapper, button state",
                     "quit": "Q/q and Ctrl+C send a final zero action then release resources",
                 },
                 "visualization": visual.describe(),
+                "interactive_cube": cube.status(),
+                "recording": recorder.summary(),
                 "grasp_telemetry": {
                     "config": config.grasp_telemetry.to_dict(),
                     "initial": grasp.update(),
@@ -935,18 +1079,18 @@ def run_gripper_teleop(
             }
         )
         print(
-            f"{robot} + {composer.gripper.__class__.__name__} ready: "
+            f"{spec.robot} + {composer.gripper.__class__.__name__} ready: "
             "SpaceMouse input uses the primary-camera frame and drives world-frame OSC_POSE; "
             "left closes and right opens the gripper."
         )
-        if isinstance(buttons, JacoContinuousGripperButtonController):
+        if isinstance(buttons, ThreeFingerContinuousGripperButtonController):
             print(
-                "Jaco gripper button mapping: "
+                "Three-finger gripper button mapping: "
                 f"left[{buttons.left_button_index}]=close while held, "
                 f"right[{buttons.right_button_index}]=open while held, "
                 f"rate={buttons.rate_per_s:.3g} policy-units/s."
             )
-        print("R resets. Q or Ctrl+C exits safely.")
+        print("B enlarges the Lift cube once. R resets. Q or Ctrl+C exits safely.")
         log.event(
             {
                 "event": "environment_reset",
@@ -967,6 +1111,12 @@ def run_gripper_teleop(
                 # point at a pre-reset scene.
                 if visual is not None:
                     visual.close()
+                if cube is not None and cube.enlarged:
+                    log.event({
+                        "event": "cube_size_restored_before_reset",
+                        "timestamp_monotonic_s": time.monotonic(),
+                        "cube": cube.restore_default(),
+                    })
                 composer, initial_action = reset_gripper_environment(
                     env,
                     mapper=mapper,
@@ -982,6 +1132,7 @@ def run_gripper_teleop(
                 )
                 control_frame = visual.configure_control_frame(env, mapper)
                 grasp = GraspTelemetry(env, config.grasp_telemetry)
+                cube = InteractiveCubeScaler(env, factor=cube_enlarge_factor)
                 log.event(
                     {
                         "event": "environment_reset",
@@ -996,6 +1147,19 @@ def run_gripper_teleop(
                 print("environment_reset")
                 previous = time.monotonic()
                 continue
+
+            if cube_resize_requested:
+                cube_resize_requested = False
+                cube_event = cube.enlarge() if cube is not None else {
+                    "changed": False,
+                    "reason": "cube_scaler_not_initialized",
+                }
+                log.event({
+                    "event": "cube_size_request",
+                    "timestamp_monotonic_s": time.monotonic(),
+                    "cube": cube_event,
+                })
+                print(f"cube resize: {cube_event}")
 
             cycle_start = time.monotonic()
             # Measured control-loop duration, not a fixed nominal period.
@@ -1014,12 +1178,13 @@ def run_gripper_teleop(
             )
             action = composer.compose(wrist_delta, gripper.value)
             _observation, reward, done, _info = env.step(action)
+            recorder.capture(env)
             grasp_event = grasp.update() if grasp is not None else {"available": False, "reason": "not_initialized"}
             previous = cycle_start
             visual_event = visual.update(
                 env,
                 status_text=(
-                    f"{robot} | gripper={gripper.state} | "
+                    f"{spec.robot}+{spec.gripper_type} | gripper={gripper.state} | "
                     f"buttons={','.join(gripper.rising_edges) or '-'}"
                 ),
             ) if visual is not None else {}
@@ -1059,6 +1224,8 @@ def run_gripper_teleop(
                     "reward": reward,
                     "done": done,
                     "visualization": visual_event,
+                    "recording": recorder.summary() if recorder.frame_count == 1 else None,
+                    "interactive_cube": cube.status() if cube is not None else None,
                     "grasp": grasp_event,
                     "loop_seconds": time.monotonic() - cycle_start,
                 }
@@ -1066,7 +1233,7 @@ def run_gripper_teleop(
             log.event(event)
             if cycle_start - last_status >= 1.0:
                 print(
-                    f"{robot} step: wrist={np.round(wrist_delta, 5).tolist()} "
+                    f"{spec.robot}+{spec.gripper_type} step: wrist={np.round(wrist_delta, 5).tolist()} "
                     f"gripper={gripper.state} update={event['update_hz']:.1f}Hz"
                 )
                 last_status = cycle_start
@@ -1089,6 +1256,12 @@ def run_gripper_teleop(
                         "grasp": grasp.summary(),
                     }
                 )
+            recorder.close()
+            log.event({
+                "event": "recording_summary",
+                "timestamp_monotonic_s": time.monotonic(),
+                "recording": recorder.summary(),
+            })
             last_action = close_gripper_resources(
                 env=env,
                 composer=composer,
@@ -1118,5 +1291,5 @@ def run_gripper_teleop(
             }
         )
         log.close()
-        print(f"{robot} gripper teleoperation stopped: {reason}. Log: {log.path}")
+        print(f"{spec.robot}+{spec.gripper_type} teleoperation stopped: {reason}. Log: {log.path}")
     return exit_code
