@@ -26,9 +26,22 @@ The robot never helps. No auto-grasp, no snapping to objects, no "smart" correct
 
 Recorded by me on 2026-10-22, trimmed, faces in the webcam window pixelated. GIFs are sped up (4x, Allegro 3x); click one for the MP4 at half that speed.
 
-| [![Panda + Allegro Hand grasping a cube](docs/media/allegro_cube_grasp.gif)](docs/media/allegro_cube_grasp.mp4) | [![Panda + Robotiq three-finger gripper in LIBERO](docs/media/libero_robotiq3_pick_place.gif)](docs/media/libero_robotiq3_pick_place.mp4) | [![Jaco + three-finger gripper lifting a cube](docs/media/jaco3_cube_lift.gif)](docs/media/jaco3_cube_lift.mp4) |
-| --- | --- | --- |
-| **Panda + Allegro Hand.** Grab the cube, lift it. Arm from the SpaceMouse, fingers from the webcam. Getting the thumb to actually pinch took the longest. | **Panda + Robotiq 3-finger gripper** in the same LIBERO scene. Hold one SpaceMouse button to close, the other to open. | **Jaco + 3-finger gripper** lifting a cube, after I sped up its gripper. |
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <a href="docs/media/allegro_cube_grasp.mp4"><img src="docs/media/allegro_cube_grasp.gif" width="100%" alt="Panda + Allegro Hand grasping a cube"></a><br>
+      <b>Panda + Allegro Hand.</b> Grab the cube, lift it. Arm from the SpaceMouse, fingers from the webcam. Getting the thumb to actually pinch took the longest.
+    </td>
+    <td width="33%" valign="top">
+      <a href="docs/media/libero_robotiq3_pick_place.mp4"><img src="docs/media/libero_robotiq3_pick_place.gif" width="100%" alt="Panda + Robotiq three-finger gripper in LIBERO"></a><br>
+      <b>Panda + Robotiq 3-finger gripper</b> in the same LIBERO scene. Hold one SpaceMouse button to close, the other to open.
+    </td>
+    <td width="33%" valign="top">
+      <a href="docs/media/jaco3_cube_lift.mp4"><img src="docs/media/jaco3_cube_lift.gif" width="100%" alt="Jaco + three-finger gripper lifting a cube"></a><br>
+      <b>Jaco + 3-finger gripper</b> lifting a cube, after I sped up its gripper.
+    </td>
+  </tr>
+</table>
 
 To be upfront: LIBERO has an official success check, and it didn't fire in any of these runs. The task wants the bowl on the plate; in the Shadow clip I put it on the stove. So these clips show that the interface works, they're not benchmark numbers.
 
