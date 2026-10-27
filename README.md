@@ -8,7 +8,7 @@
   <sub>Panda + Shadow Hand in a LIBERO kitchen scene. The SpaceMouse moves the arm; my right hand in the little webcam window moves the fingers (the pixel blob is my face). 4x speed, click for the 2x MP4.</sub>
 </p>
 
-Hi, I'm Eason, a master's student at UVA, and this is my teleoperation playground in the UVA HRI Lab. The question behind it is pretty simple: how far can you get controlling a robot hand with stuff that's already on your desk? No data glove, no mocap suit, no VR headset. Just a 3Dconnexion SpaceMouse and a webcam.
+Hi, I'm Eason, a master's student at UVA, and this is my teleoperation playground in Prof. Yen-Ling Kuo's LIVE Robotics Lab at UVA. The question behind it is pretty simple: how far can you get controlling a robot hand with stuff that's already on your desk? No data glove, no mocap suit, no VR headset. Just a 3Dconnexion SpaceMouse and a webcam.
 
 The setup, in one breath:
 
