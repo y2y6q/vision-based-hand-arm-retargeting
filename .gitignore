@@ -24,6 +24,7 @@ tmp/
 outputs/
 MUJOCO_LOG.TXT
 *.log
+AGENTS.md
 
 # External clone (installed into .venv-libero, not redistributed) and an
 # unrelated course project kept in the same folder
