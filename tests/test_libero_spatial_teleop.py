@@ -85,6 +85,33 @@ class LiberoShadowTeleopTests(unittest.TestCase):
             self.session.env.step(action)
         self.assertLess(np.linalg.norm(composer.ee_pose()[0] - moved), 0.01)
 
+    def test_pure_rotation_settles_after_release(self):
+        """Regression for the 2026-11-05 yaw creep (split OSC inertia blocks)."""
+
+        composer = self._composer()
+        self.assertFalse(composer.controller.uncoupling)
+        for _ in range(15):
+            self.session.env.step(composer.compose(np.zeros(6)))
+        composer.initialize_goal()
+        p0, r0 = composer.ee_pose()
+        for _ in range(30):
+            self.session.env.step(composer.compose(np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.025])))
+        p1 = composer.ee_pose()[0]
+        trail = []
+        for _ in range(40):
+            self.session.env.step(composer.compose(np.zeros(6)))
+            trail.append(composer.ee_pose())
+        (p2, r2), (p_late, r_late) = trail[-1], trail[-11]
+
+        def angle(a, b):
+            return np.degrees(np.arccos(np.clip((np.trace(a.T @ b) - 1.0) / 2.0, -1.0, 1.0)))
+
+        self.assertGreater(angle(r0, r2), 30.0)
+        self.assertLess(np.linalg.norm(p1 - p0), 0.005)
+        self.assertLess(np.linalg.norm(p2 - p1), 0.001)
+        self.assertLess(np.linalg.norm(p2 - p_late), 1e-4)
+        self.assertLess(angle(r_late, r2), 0.05)
+
     def test_reset_rebinds_laser_to_new_sim(self):
         from wrist_teleop.visualization import LaserPointer
 

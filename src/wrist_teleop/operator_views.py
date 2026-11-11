@@ -147,12 +147,15 @@ def _text(cv2: Any, frame: np.ndarray, text: str, origin: tuple[int, int], color
 class OperatorOverlay:
     """Draws the operator aids onto the composed tri-view (RGB) image."""
 
-    def __init__(self, top: OrthoView, side: OrthoView, *, depth_deadzone_m: float, edge_warning: float,
-                 edge_margin: float = 0.01, depth_gauge_range_m: float = 0.12, inset_width_px: int = 400):
+    def __init__(self, top: OrthoView, side: OrthoView, *, edge_warning: float,
+                 edge_margin: float = 0.01, depth_gauge_range_m: float = 0.15, inset_width_px: int = 400,
+                 ui_scale: float = 1.0):
         self.top, self.side = top, side
-        self.depth_deadzone_m, self.depth_gauge_range_m = float(depth_deadzone_m), float(depth_gauge_range_m)
+        self.depth_gauge_range_m = float(depth_gauge_range_m)
         self.edge_warning, self.edge_margin = float(edge_warning), float(edge_margin)
-        self.inset_width_px = int(inset_width_px)
+        # Text, marker and preview sizes were tuned on a 1080-pixel-high window.
+        self.ui_scale = float(ui_scale)
+        self.inset_width_px = int(round(inset_width_px * self.ui_scale))
         self.state: dict[str, Any] = {}
 
     def __call__(self, frame: np.ndarray, rects: dict[str, tuple[int, int, int, int]]) -> None:
@@ -161,32 +164,35 @@ class OperatorOverlay:
         state = dict(self.state)
         palm = state.get("palm_world")
         hit = state.get("hit_world")
+        k = self.ui_scale
         for view, name, label in ((self.top, "wrist", "TOP (plan)   up = away"),
                                   (self.side, "side", "SIDE (elevation)")):
             x0, y0, width, height = rects[name]
             panel = frame[y0:y0 + height, x0:x0 + width]
-            _text(cv2, panel, label, (8, 22), WHITE, 0.55)
+            _text(cv2, panel, label, (int(8 * k), int(22 * k)), WHITE, 0.55 * k)
             if palm is None:
                 continue
             centre = view.project(palm)
             if view is self.side and hit is not None:
                 ground = view.project(hit)
+                tick = int(14 * k)
                 cv2.line(panel, centre, ground, RED, 1, cv2.LINE_AA)
-                cv2.line(panel, (ground[0] - 14, ground[1]), (ground[0] + 14, ground[1]), RED, 2, cv2.LINE_AA)
+                cv2.line(panel, (ground[0] - tick, ground[1]), (ground[0] + tick, ground[1]), RED, 2, cv2.LINE_AA)
                 clearance = state.get("clearance_m")
                 if clearance is not None:
-                    _text(cv2, panel, f"{100 * clearance:.1f} cm", (centre[0] + 14, (centre[1] + ground[1]) // 2),
-                          YELLOW, 0.6, 2)
+                    _text(cv2, panel, f"{100 * clearance:.1f} cm", (centre[0] + tick, (centre[1] + ground[1]) // 2),
+                          YELLOW, 0.6 * k, 2)
             if view is self.top and hit is not None:
                 centre = view.project(hit)
-            _cross(cv2, panel, centre, RED)
+            _cross(cv2, panel, centre, RED, int(12 * k))
         self._draw_main(cv2, frame, rects["front"], state)
 
     def _draw_main(self, cv2: Any, frame: np.ndarray, rect: tuple[int, int, int, int], state: dict[str, Any]) -> None:
         x0, y0, width, height = rect
         panel = frame[y0:y0 + height, x0:x0 + width]
+        k = self.ui_scale
         for row, (line, color) in enumerate(state.get("lines", ())):
-            _text(cv2, panel, line, (12, 52 + 26 * row), color, 0.62, 1)
+            _text(cv2, panel, line, (int(12 * k), int((52 + 26 * row) * k)), color, 0.62 * k, 1)
         camera = state.get("camera_frame")
         if camera is None:
             return
@@ -206,15 +212,17 @@ class OperatorOverlay:
         cv2.rectangle(inset, (mx, my), (inset_w - mx, inset_h - my), zone_color, 2)
         badge = state.get("badge")
         if badge:
-            _text(cv2, inset, badge[0], (12, 34), badge[1], 0.9, 2)
-        gauge_w, gap = 34, 8
-        left, top = 12, height - inset_h - 30  # room for the gauge's lower label
+            _text(cv2, inset, badge[0], (int(12 * k), int(34 * k)), badge[1], 0.9 * k, 2)
+        gauge_w, gap = int(34 * k), int(8 * k)
+        left, top = int(12 * k), height - inset_h - int(30 * k)  # room for the gauge's lower label
         panel[top:top + inset_h, left:left + inset_w] = inset
         cv2.rectangle(panel, (left - 1, top - 1), (left + inset_w, top + inset_h), WHITE, 1)
         self._draw_depth_gauge(cv2, panel, (left + inset_w + gap, top, gauge_w, inset_h), state)
 
     def _draw_depth_gauge(self, cv2: Any, panel: np.ndarray, rect: tuple[int, int, int, int],
                           state: dict[str, Any]) -> None:
+        """How far the hand is nearer (up) / farther (down) than where tracking (re)started."""
+
         x, y, width, height = rect
         cv2.rectangle(panel, (x, y), (x + width, y + height), (30, 30, 30), -1)
         span = self.depth_gauge_range_m
@@ -223,12 +231,12 @@ class OperatorOverlay:
         def to_y(offset: float) -> int:
             return int(round(centre_y - float(np.clip(offset / span, -1.0, 1.0)) * (height // 2 - 4)))
 
-        cv2.rectangle(panel, (x, to_y(self.depth_deadzone_m)), (x + width, to_y(-self.depth_deadzone_m)), (70, 70, 70), -1)
         cv2.line(panel, (x, centre_y), (x + width, centre_y), GREY, 1)
         offset = state.get("depth_offset_m")
         if offset is not None:
-            active = abs(offset) > self.depth_deadzone_m
             marker = to_y(offset)
-            cv2.rectangle(panel, (x + 3, marker - 4), (x + width - 3, marker + 4), YELLOW if active else GREEN, -1)
-        _text(cv2, panel, "away", (x - 2, y - 6), WHITE, 0.45)
-        _text(cv2, panel, "back", (x - 2, y + height + 16), WHITE, 0.45)
+            near_end = abs(offset) > 0.8 * span  # running out of comfortable hand travel: use the clutch
+            cv2.rectangle(panel, (x + 3, marker - 4), (x + width - 3, marker + 4), YELLOW if near_end else GREEN, -1)
+        k = self.ui_scale
+        _text(cv2, panel, "away", (x - 2, y - int(6 * k)), WHITE, 0.45 * k)
+        _text(cv2, panel, "back", (x - 2, y + height + int(16 * k)), WHITE, 0.45 * k)

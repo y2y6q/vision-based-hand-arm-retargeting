@@ -44,9 +44,6 @@ from .camera_arm_control import (
 from .config import WristConfig
 from .hand_input import CameraHandWorker
 from .libero_spatial_teleop import (
-    LIBERO_MAIN_VIEW_WIDTH_PX,
-    LIBERO_SIDE_VIEW_WIDTH_PX,
-    PANDA_SHADOW_SPEC,
     LiberoActionComposer,
     OfficialLiberoSpatialSession,
     _RunLog,
@@ -54,7 +51,11 @@ from .libero_spatial_teleop import (
     _shadow_laser_config,
     _shadow_tri_view_config,
     _sleep,
+    describe_object_masses,
+    follow_robot_base,
+    shadow_spec,
 )
+from .libero_views import LiberoViewWindow, Panel, default_view_size, enable_dpi_awareness
 from .mapper import SixDofMapper
 from .operator_views import (
     BLUE,
@@ -66,14 +67,21 @@ from .operator_views import (
     apply_ortho_view,
     plan_and_elevation_views,
 )
-from .runtime_controls import KeyboardCommandRouter
+from .runtime_controls import KeyboardCommandRouter, ResetFeedback
 from .shadow_dex import ShadowDexHandInput, ShadowDexRetargeter
 from .shadow_hand_input import ShadowHandGestureController, ShadowLegacyHandInput
 from .synthetic_hand import SyntheticHandWorker
-from .visualization import LaserPointer, TriViewCompositor
+from .visualization import LaserPointer
 
 CAMERA_SPEC_LOG_NAME = "panda_shadow_camera"
-MAX_SPEED_M_S = 0.20
+# Same stiffness as the SpaceMouse LIBERO entries (raised from 300 there too):
+# it trails a moving target by ~50 ms of simulated time instead of ~100 ms,
+# with no overshoot and less finger-motion drift (measured 2026-10-28).
+CAMERA_OSC_KP = 500.0
+# A quick hand sweep commands more than this; the arm catches up after the
+# hand stops, so a higher cap shortens that tail (0.20 -> 0.30: ~400 -> ~300 ms
+# after a 6 cm / 0.4 s sweep).
+MAX_SPEED_M_S = 0.30
 MAX_ROT_SPEED_RAD_S = 1.2
 # The accumulated target may lead the commanded goal by at most this much
 # travel time: a fast hand cannot queue motion that continues after it stops.
@@ -220,16 +228,25 @@ def run_libero_camera_teleop(
     hand_control: str,
     synthetic_hand: bool,
     three_view: bool,
+    suite: str = "libero_spatial",
+    hand_mount: str = "forward",
+    object_mass_scale: float = 1.0,
+    view_size: Optional[tuple[int, int]] = None,
+    dex_grasp_terms: bool = True,
+    thumb_lift_gain: Optional[float] = None,
 ) -> int:
     if hand_control not in ("dex", "legacy-curl", "off"):
         raise ValueError("hand_control must be dex, legacy-curl or off")
-    spec = PANDA_SHADOW_SPEC
-    log = _RunLog(replace(spec, name=CAMERA_SPEC_LOG_NAME))
+    spec = shadow_spec(hand_mount)
+    enable_dpi_awareness()  # before any window: the views are shown 1:1
+    log = _RunLog(replace(spec, name=CAMERA_SPEC_LOG_NAME + ("_down" if hand_mount == "down" else "")))
     session = OfficialLiberoSpatialSession(
         spec, config, task_id=task_id, task_order=task_order, init_state_id=init_state_id,
-        seed=seed, has_offscreen_renderer=bool(three_view),
+        seed=seed, has_offscreen_renderer=bool(three_view), osc_kp=CAMERA_OSC_KP, suite=suite,
+        object_mass_scale=object_mass_scale,
     )
     keyboard = KeyboardCommandRouter()
+    reset_feedback = ResetFeedback(keyboard)  # R during a reset is dropped; the views say RESETTING
     arm = CameraArmMapper(settings)
     basis_mapper = SixDofMapper(config)  # only for the primary-camera basis
     follower = TargetFollower(MAX_SPEED_M_S, MAX_ROT_SPEED_RAD_S)
@@ -275,7 +292,7 @@ def run_libero_camera_teleop(
         tri_view.configure_cameras(env)
         basis_mapper.set_camera_from_sim(env, tri_config.front_camera_name)
         basis = basis_mapper.control_rotation
-        sizes = tri_config.panel_sizes
+        sizes = tri_view.panel_sizes
         points = np.vstack((scene_points_xy(env), composer.ee_pose()[0][:2]))
         top, side = plan_and_elevation_views(
             points, (float(limits.box_min[2]) - 0.05, float(limits.box_max[2])), basis,
@@ -295,14 +312,13 @@ def run_libero_camera_teleop(
         env = session.env
         composer = LiberoActionComposer(env, spec)
         composer.initialize_goal()
+        if session.object_mass_scale != 1.0:
+            print(describe_object_masses(session))
         rebuild_protection(env)
         basis = basis_mapper.control_rotation
         tri_config = replace(
-            _shadow_tri_view_config(config),
+            follow_robot_base(_shadow_tri_view_config(config), env),
             wrist_camera_name=TOP_CAMERA, side_camera_name=SIDE_CAMERA,
-            image_width=LIBERO_MAIN_VIEW_WIDTH_PX,
-            thumbnail_scale=LIBERO_SIDE_VIEW_WIDTH_PX / LIBERO_MAIN_VIEW_WIDTH_PX,
-            display_width=None, display_height=None,
             window_name="LIBERO camera teleop: Panda + Shadow",
         )
         # A vertical palm laser: where the hand is above the table / bowl, in
@@ -313,19 +329,24 @@ def run_libero_camera_teleop(
         )
         if three_view and tri_config.enabled:
             laser = LaserPointer(env, laser_config)
-            overlay = OperatorOverlay(None, None, depth_deadzone_m=settings.depth_deadzone_m,
-                                      edge_warning=settings.edge_warning)
-            tri_view = TriViewCompositor(
-                tri_config, show_window=not headless,
-                key_handler=lambda key: route(key, "tri_view"),
-                on_close=lambda: keyboard.feed("q", source="tri_view_window"), laser=laser, overlay=overlay,
+            size = view_size or default_view_size()
+            overlay = OperatorOverlay(None, None, edge_warning=settings.edge_warning, ui_scale=size[1] / 1080.0)
+            # Same threaded 1:1 window as the SpaceMouse entries; the two
+            # small panels stay this entry's orthographic plan / elevation.
+            tri_view = LiberoViewWindow(
+                tri_config, (Panel("front", "", camera=tri_config.front_camera_name),
+                             Panel("wrist", "", camera=TOP_CAMERA), Panel("side", "", camera=SIDE_CAMERA)),
+                size=size, show_window=not headless,
+                key_handler=lambda key: route(key, "views"),
+                on_close=lambda: keyboard.feed("q", source="views_window"), laser=laser, overlay=overlay,
             )
             setup_views(env)
 
         lower, upper = composer.gripper.lower_limits, composer.gripper.upper_limits
         if hand_control == "dex":
             print("Starting official dex-retargeting sidecar for Shadow (first launch can take ~60 s)...")
-            retargeter = ShadowDexRetargeter()
+            retargeter = (ShadowDexRetargeter(thumb_lift_gain=thumb_lift_gain) if dex_grasp_terms
+                           else ShadowDexRetargeter(grasp_terms_path=None))
             fingers = ShadowDexHandInput(
                 retargeter, lower, upper, stale_timeout_s=config.dex_hand.stale_timeout_s,
                 expected_handedness=config.dex_hand.expected_handedness, unmirror_world_x=camera_mirror,
@@ -368,18 +389,19 @@ def run_libero_camera_teleop(
             "dex": retargeter.metadata() if retargeter is not None else None,
         })
         print("LIBERO camera teleop ready: {}".format(session.task.language))
-        print("Show your open RIGHT hand to the camera; the arm starts after a few stable frames.")
-        print("Left/right, up/down: move the hand (faster = farther). Away/back: hold the hand nearer/farther.")
+        print("Show your open RIGHT hand to the camera and hold it still; the arm then follows it.")
+        print("Move the hand left/right, up/down, toward/away from the camera (faster = farther). Still hand = still arm.")
         print("Keys: LEFT hand = clutch | C pause | -/= gain | R reset | Q quit")
 
-        started = previous = time.monotonic()
+        started = previous = time.perf_counter()
         stuck_since: Optional[float] = None
         last_state = None
-        while duration_s is None or time.monotonic() - started < duration_s:
+        while duration_s is None or time.perf_counter() - started < duration_s:
             if keyboard.stop_event.is_set():
                 reason = keyboard.quit_reason or "Q"
                 break
             if keyboard.take_reset():
+                reset_feedback.begin(tri_view)
                 session.reset()
                 composer = LiberoActionComposer(env, spec)
                 composer.initialize_goal()
@@ -392,10 +414,11 @@ def run_libero_camera_teleop(
                     tri_view.laser = laser
                     setup_views(env)
                 log.event({"event": "environment_reset", "timestamp_monotonic_s": time.monotonic()})
-                previous = time.monotonic()
+                previous = time.perf_counter()
                 continue
-            tick = time.monotonic()
-            dt = float(np.clip(tick - previous, 1.0 / config.control_hz, 2.0 / config.control_hz))
+            loop_start = time.perf_counter()
+            tick = time.monotonic()  # hand timestamps share the camera worker's clock
+            dt = float(np.clip(loop_start - previous, 1.0 / config.control_hz, 2.0 / config.control_hz))
             measured_pos, measured_ori = composer.ee_pose()
             goal_pos = composer.goal_pos if composer.goal_pos is not None else measured_pos
             goal_ori = composer.goal_ori if composer.goal_ori is not None else measured_ori
@@ -456,9 +479,8 @@ def run_libero_camera_teleop(
                     ("ARM {}{}".format(
                         status.state.upper(), "   rotation held while moving" if details.get("rotation_frozen") else ""),
                      WHITE),
-                    ("gain x{:.2f}  now {:.2f}   depth {:+.0f} cm/s".format(
-                        settings.translation_gain, details.get("effective_gain", 0.0),
-                        100.0 * details.get("depth_rate_m_s", 0.0)), WHITE),
+                    ("gain x{:.2f}  now {:.2f}".format(settings.translation_gain, details.get("effective_gain", 0.0)),
+                     WHITE),
                 ]
                 if clearance is not None:
                     lines.append(("palm {:.1f} cm above {}".format(100.0 * clearance, laser_record.get("hit_geom")), WHITE))
@@ -483,16 +505,15 @@ def run_libero_camera_teleop(
                     "depth_offset_m": details.get("depth_offset_m"),
                 }
             visual = tri_view.update(env, status_text=session.task.language) if tri_view is not None else {"enabled": False}
-            if tri_view is not None and visual.get("rendered") and not screenshot_written:
+            if tri_view is not None and tri_view.last_frame is not None and not screenshot_written:
                 screenshot = log.path / "tri_view_initial.png"
                 screenshot_written = bool(tri_view.save_last_frame(screenshot))
             if tri_view is not None and visual.get("closed"):
                 keyboard.feed("q", source="tri_view")
             if camera_display and not headless and not embed_preview and hasattr(camera, "show_latest"):
                 camera.show_latest()
-            elapsed = max(tick - previous, 1e-9)
-            loop_periods.append(elapsed)
-            previous = tick
+            loop_periods.append(max(loop_start - previous, 1e-9))
+            previous = loop_start
             log.event({
                 "event": "step", "timestamp_monotonic_s": tick, "arm_state": status.state,
                 "hand_offset_control_m": status.hand_offset_m, "hand_rotvec_control": status.hand_rotation_rad,
@@ -503,10 +524,13 @@ def run_libero_camera_teleop(
                 "pose_error": hand_input.last_pose_error, "arm_details": status.details,
                 "clearance_m": clearance,
                 "hand_source": hand_command.source, "hand_action": action[composer.hand_slice],
+                "camera_details": camera_command.details,
                 "reward": reward, "task_success": bool(env._check_success()),
                 "visualization": {"laser": laser_record, "tri_view": visual},
             })
-            _sleep(tick, config.control_hz)
+            if reset_feedback.active:  # first step on the new model done: the scene is back
+                log.event(reset_feedback.settle(tri_view))
+            _sleep(loop_start, config.control_hz)
     except KeyboardInterrupt:
         reason = "Ctrl+C"
     except Exception as exc:

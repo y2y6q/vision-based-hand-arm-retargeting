@@ -327,10 +327,11 @@ class DexHandConfig:
     input_is_mirrored: bool = False
     runtime: str = "auto"
     sidecar_python: str | None = None
-    # The official solver returns an absolute source-size target. A live
-    # operator can instead map changes from a comfortable camera neutral pose
-    # around the simulated hand's safe-open pose.
-    relative_motion: bool = True
+    # The official solver returns an absolute source-size target; that is the
+    # default since the 2026-11-05 un-mirror / full-scale fix. The optional
+    # relative mode instead maps changes from the first camera pose (or the C
+    # re-centre pose) around the simulated hand's safe-open pose.
+    relative_motion: bool = False
     relative_motion_gain: float = 1.0
 
     def __post_init__(self) -> None:
@@ -430,6 +431,13 @@ class WristConfig:
     dominant_switch_ratio: float = 1.5
     axis_snap_ratio: float = 0.3
     control_hz: float = 20.0
+    # Camera hand targets reach the simulator exactly this long after their
+    # frame was read, the same on every tick (``FixedDelayResampler``). It
+    # must cover one camera frame interval plus processing; a tick whose next
+    # frame is not in yet holds the newest sample. 0 = newest sample as is.
+    # Measured 2026-11-05 (30 fps webcam, curl-pinch): 60 ms leaves 0.16 % of
+    # ticks holding, 65 ms 0.13 %; dex adds ~5-8 ms of processing.
+    hand_target_delay_s: float = 0.065
     stale_timeout_s: float = 0.25
     # Some SpaceMouse HID drivers report a button only on its transition,
     # rather than continuously while it remains pressed. A confirmed pressed
@@ -503,6 +511,10 @@ class WristConfig:
                      "max_rotation_delta_rad", "control_hz", "stale_timeout_s",
                      "button_hold_timeout_s", "discovery_interval_s", "neutral_startup_s"):
             object.__setattr__(self, name, _finite_number(name, getattr(self, name)))
+        delay = _finite_number("hand_target_delay_s", self.hand_target_delay_s, inclusive=True)
+        if delay > 0.3:
+            raise ValueError("hand_target_delay_s must be in [0, 0.3]")
+        object.__setattr__(self, "hand_target_delay_s", delay)
         if self.motion_coupling not in ("dominant", "combined"):
             raise ValueError("motion_coupling must be 'dominant' or 'combined'")
         ratio = _finite_number("dominant_switch_ratio", self.dominant_switch_ratio)

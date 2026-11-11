@@ -41,7 +41,6 @@ from wrist_teleop import (  # noqa: E402
 from wrist_teleop.allegro_hand_input import AllegroCurlPinchHandInput  # noqa: E402
 from wrist_teleop.allegro_model import make_allegro_panda_env  # noqa: E402
 from wrist_teleop.allegro_model import (  # noqa: E402
-    ALLEGRO_GEOMETRY_SCALE,
     ALLEGRO_JOINT_NAMES,
     ALLEGRO_PALM_DOWN_NORMAL_LOCAL,
     ALLEGRO_PALM_VIEW_CAMERA,
@@ -57,10 +56,12 @@ from wrist_teleop.runtime_controls import KeyboardCommandRouter  # noqa: E402
 from wrist_teleop.visualization import LaserPointer, TriViewCompositor  # noqa: E402
 from wrist_teleop.grasp_telemetry import GraspTelemetry  # noqa: E402
 from wrist_teleop.interactive_cube import InteractiveCubeScaler  # noqa: E402
+from wrist_teleop.loop_timing import FixedDelayResampler, FixedRateClock, StageProfiler  # noqa: E402
 from wrist_teleop.recording import SimVideoRecorder  # noqa: E402
 
 
 _INTERACTIVE_CUBE_ENLARGE_FACTOR = 1.5
+_TIMING_SUMMARY_PERIOD_S = 2.0
 # Keep the same reset treatment as the Panda + Shadow entry: let the hand
 # reach its safe-open target under normal MuJoCo physics, then re-latch OSC at
 # the settled end-effector pose before the viewer accepts SpaceMouse motion.
@@ -166,8 +167,15 @@ class _NeutralInputDevice:
         self._opened = False
 
 
-def _make_hand_input(config: WristConfig, hand_control: str):
-    """Create a hand source without allowing dex to silently fall back."""
+def _make_hand_input(config: WristConfig, hand_control: str, camera_mirror: bool = True):
+    """Create a hand source without allowing dex to silently fall back.
+
+    The dex solver gets full-size human landmarks (reference scale 1.0): it
+    solves joint angles for the full-size Allegro URDF and joint angles do not
+    depend on the 2/3 scale of the MuJoCo model, so shrinking the input only
+    made every finger look half bent. When the camera image is mirrored the
+    world landmarks are un-mirrored before retargeting.
+    """
 
     if hand_control == "curl-pinch":
         return AllegroCurlPinchHandInput(), None
@@ -182,7 +190,6 @@ def _make_hand_input(config: WristConfig, hand_control: str):
         upper_limits=[spec.upper for spec in specs],
         runtime=config.dex_hand.runtime,
         sidecar_python=config.dex_hand.sidecar_python,
-        reference_landmark_scale=ALLEGRO_GEOMETRY_SCALE,
     )
     return DexHandInputAdapter(
         retargeter,
@@ -194,6 +201,7 @@ def _make_hand_input(config: WristConfig, hand_control: str):
         input_is_mirrored=config.dex_hand.input_is_mirrored,
         relative_motion=config.dex_hand.relative_motion,
         relative_motion_gain=config.dex_hand.relative_motion_gain,
+        unmirror_world_x=bool(camera_mirror),
     ), retargeter
 
 
@@ -453,6 +461,56 @@ def run_integrated(
     exit_code = 0
     last_buttons = (False,) * 8
     control_frame: dict[str, Any] = mapper.describe_control_frame()
+    # Per-stage loop timing (perf_counter). Each step logs its own stage
+    # times; a rolling summary (rate, latency, p99 jitter) of the loop, the
+    # camera worker and the dex sidecar is logged every few seconds and at exit.
+    profiler = StageProfiler()
+    step_ms: dict[str, float] = {}
+    # The simulator stays at control_hz; the loop is paced on a fixed grid
+    # (next_tick += period) so per-cycle work and sleep rounding do not drift
+    # the rate. Each tick uses the camera hand as it was exactly
+    # hand_target_delay_s earlier, interpolated between the camera samples
+    # around that moment, so the hand delay is the same on every tick.
+    clock = FixedRateClock(config.control_hz)
+    hand_resampler = FixedDelayResampler(16, config.hand_target_delay_s)
+    hand_sample_seq = 0
+    last_pace: dict[str, float] | None = None
+
+    def timed(name: str, start: float) -> float:
+        end = time.perf_counter()
+        profiler.add(name, end - start, end)
+        step_ms[name] = 1e3 * (end - start)
+        return end
+
+    def timing_summary(summary_reason: str) -> dict[str, Any]:
+        # Telemetry must never break the exit path: sources without timing
+        # (or whose timing fails) are reported as None.
+        def optional_snapshot(source: Any) -> Any:
+            snapshot = getattr(source, "timing_snapshot", None)
+            if not callable(snapshot):
+                return None
+            try:
+                return snapshot()
+            except Exception as exc:
+                return {"error": f"{type(exc).__name__}: {exc}"}
+
+        return {
+            "event": "timing_summary",
+            "reason": summary_reason,
+            "timestamp_monotonic_s": time.monotonic(),
+            "control_hz": config.control_hz,
+            "clock": {
+                "period_ms": 1e3 * clock.period_s,
+                "ticks": clock.ticks,
+                "overruns_dropped_ticks": clock.overruns,
+                "high_resolution_timer": clock.high_resolution_timer,
+            },
+            "main_loop": profiler.snapshot(),
+            "camera_worker": optional_snapshot(camera),
+            "dex": optional_snapshot(retargeter),
+            "hand_resampling": hand_resampler.describe(),
+        }
+
     try:
         log.event({
             "event": "hand_mode_requested",
@@ -462,7 +520,7 @@ def run_integrated(
         })
         if hand_control == "dex":
             print("Preparing official dex-retargeting (a cold Windows start can take up to 90 seconds)...")
-        hand_input, retargeter = _make_hand_input(config, hand_control)
+        hand_input, retargeter = _make_hand_input(config, hand_control, camera_mirror)
         if retargeter is not None:
             # Record the native solver identity before HID / camera startup so
             # a later hardware error cannot hide what dex runtime was used.
@@ -550,6 +608,7 @@ def run_integrated(
                 ),
                 "mode": hand_control,
                 "smoothing_alpha": hand_input.smoothing_alpha,
+                "target_delay_ms": 1e3 * config.hand_target_delay_s,
                 "stale_timeout_s": hand_input.stale_timeout_s,
                 "calibration_state": hand_input.calibration_state,
                 "dex": None if retargeter is None else retargeter.metadata(),
@@ -604,6 +663,8 @@ def run_integrated(
             "cube": cube_scaler.status(),
         })
         start = previous = time.monotonic()
+        previous_tick: float | None = None
+        last_summary_at = clock.restart()
         while duration_s is None or time.monotonic() - start < duration_s:
             if keyboard.stop_event.is_set():
                 reason = keyboard.quit_reason or "Q"
@@ -660,6 +721,11 @@ def run_integrated(
                 )
                 print("environment_reset")
                 previous = time.monotonic()
+                previous_tick = None  # the reset pause is not a loop period
+                last_pace = None
+                # Frames read before the reset belong to the old hand state.
+                hand_resampler.reset(discard_until_s=time.perf_counter())
+                clock.restart()
                 continue
             cube_resize_request = take_cube_resize_source()
             if cube_resize_request is not None:
@@ -688,6 +754,9 @@ def run_integrated(
             if dex_recenter_request is not None:
                 recenter = getattr(hand_input, "recenter_relative_motion", None)
                 changed = bool(callable(recenter) and recenter())
+                if changed:
+                    # Earlier samples were relative to the old neutral.
+                    hand_resampler.reset(discard_until_s=time.perf_counter())
                 log.event({
                     "event": "dex_relative_recenter",
                     "timestamp_monotonic_s": time.monotonic(),
@@ -695,14 +764,43 @@ def run_integrated(
                     "changed": changed,
                 })
                 print("dex_relative_recenter: " + ("applied" if changed else "waiting_for_valid_right_hand"))
+            step_ms.clear()
+            if last_pace is not None:
+                # How late this tick woke against the fixed grid.
+                step_ms["tick_late"] = 1e3 * last_pace["late_s"]
+            tick_start = time.perf_counter()
+            if previous_tick is not None:
+                profiler.add("loop_period", tick_start - previous_tick, tick_start)
+            previous_tick = tick_start
             cycle_start = time.monotonic()
             sample = device.poll()
+            stage_end = timed("spacemouse_poll", tick_start)
             last_buttons = sample.buttons if sample.buttons_valid else (False,) * len(sample.buttons)
             wrist_command = mapper.map(sample.control_axes, valid=sample.valid and sample.armed)
             hand_command = hand_input.latest(cycle_start)
+            result_perf = getattr(camera, "latest_result_perf_s", None)
+            if result_perf is not None:
+                # Camera / MediaPipe / dex result age when the simulator uses it.
+                profiler.add("hand_result_age", tick_start - result_perf, tick_start)
+                step_ms["hand_result_age"] = 1e3 * (tick_start - result_perf)
+            # Every camera sample since the last tick, with its frame read time.
+            samples_since = getattr(camera, "samples_since", None)
+            if callable(samples_since):
+                hand_sample_seq, new_samples = samples_since(hand_sample_seq)
+                for frame_s, frame_targets in new_samples:
+                    hand_resampler.push(frame_s, frame_targets)
+            # The same camera targets, read off at a fixed delay behind this
+            # tick. Validity (hold / safe-open) is not delayed: an invalid
+            # hand passes straight to the gesture layer as before.
+            sample_timestamp = getattr(hand_command, "sample_timestamp_s", None)
+            camera_targets = hand_command.joint_targets
+            if hand_command.valid:
+                delayed_targets = hand_resampler.sample(tick_start)
+                if delayed_targets is not None:
+                    camera_targets = delayed_targets
             gesture_command = gestures.update(
                 last_buttons,
-                hand_command.joint_targets,
+                camera_targets,
                 camera_valid=hand_command.valid,
                 timestamp_s=cycle_start,
             )
@@ -711,10 +809,13 @@ def run_integrated(
                 active_override=gesture_command.active_override,
             )
             action = composer.compose(wrist_command, gesture_command.joint_targets)
+            stage_end = timed("hand_and_compose", stage_end)
             observation, reward, done, info = env.step(action)
+            stage_end = timed("env_step", stage_end)
             recorder.capture(env)
             grasp_event = grasp.update() if grasp is not None else {"available": False, "reason": "not_initialized"}
             laser_event = laser.update() if laser is not None else {"enabled": False}
+            stage_end = timed("grasp_laser_record", stage_end)
             tri_view_event = (
                 tri_view.update(
                     env,
@@ -727,6 +828,7 @@ def run_integrated(
                 if tri_view is not None
                 else {"enabled": False}
             )
+            stage_end = timed("render_tri_view", stage_end)
             # HighGUI display is deliberately serviced here, beside tri-view,
             # rather than inside the camera worker thread.
             camera_display_event = (
@@ -734,6 +836,7 @@ def run_integrated(
                 if camera_display and hasattr(camera, "show_latest")
                 else {"enabled": False, "reason": "headless_or_unavailable"}
             )
+            stage_end = timed("camera_display", stage_end)
             if (
                 tri_view is not None
                 and tri_view_snapshot is None
@@ -767,6 +870,8 @@ def run_integrated(
                     "worker_status": camera.status() if hasattr(camera, "status") else None,
                     "display": camera_display_event,
                     "details": hand_command.details,
+                    "sample_timestamp_s": sample_timestamp,
+                    "resampling": hand_resampler.describe(),
                 },
                 hand_source=gesture_command.source,
                 hand_override=gesture_command.active_override,
@@ -785,10 +890,17 @@ def run_integrated(
                 cube_scale_factor=(cube_scaler.status().get("current_factor") if cube_scaler is not None else None),
                 grasp=grasp_event,
                 recording=recorder.summary() if recorder.frame_count == 1 else None,
-                loop_seconds=time.monotonic() - cycle_start,
+                loop_seconds=time.perf_counter() - tick_start,
+                timing_ms=dict(step_ms),
             )
             log.event(event)
-            _sleep_to_rate(cycle_start, config.control_hz)
+            stage_end = timed("log_write", stage_end)
+            timed("loop_work", tick_start)
+            if stage_end - last_summary_at >= _TIMING_SUMMARY_PERIOD_S:
+                log.event(timing_summary("periodic"))
+                last_summary_at = stage_end
+            last_pace = clock.wait()
+            profiler.add("tick_late", last_pace["late_s"])
     except KeyboardInterrupt:
         reason = "Ctrl+C"
     except Exception as exc:
@@ -837,6 +949,9 @@ def run_integrated(
             if exit_code == 0:
                 reason = cleanup_reason
                 exit_code = 1
+        final_timing = timing_summary("exit")
+        clock.close()
+        log.event(final_timing)
         log.event({
             "event": "exit",
             "reason": reason,
@@ -844,8 +959,40 @@ def run_integrated(
             "last_zero_wrist_action": last_action,
         })
         log.close()
+        print(_timing_line(final_timing))
         print(f"Integrated teleoperation stopped: {reason}. Log: {log.path}")
     return exit_code
+
+
+def _timing_line(summary: dict[str, Any]) -> str:
+    """One console line: loop rate / p99 jitter and the slowest stages."""
+
+    main = summary.get("main_loop") or {}
+    period = main.get("loop_period", {})
+    clock = summary.get("clock") or {}
+    parts = [
+        "loop {:.1f} Hz (target {:g}), p99 jitter {:.1f} ms, overruns {}".format(
+            period.get("rate_hz") or 0.0, summary.get("control_hz", 0.0), period.get("jitter_p99_ms") or 0.0,
+            clock.get("overruns_dropped_ticks", 0))
+    ]
+    for name in ("env_step", "render_tri_view", "camera_display", "spacemouse_poll", "log_write"):
+        stage = main.get(name)
+        if stage and stage.get("mean_ms") is not None:
+            parts.append("{} {:.1f}/{:.1f} ms".format(name, stage["mean_ms"], stage["p99_ms"]))
+    camera = summary.get("camera_worker") or {}
+    read = camera.get("camera_read")
+    frame = camera.get("camera_frame_total")
+    if read and read.get("rate_hz"):
+        parts.append("camera {:.1f} Hz".format(read["rate_hz"]))
+    if frame and frame.get("rate_hz"):
+        parts.append("processed {:.1f} Hz".format(frame["rate_hz"]))
+    resampling = summary.get("hand_resampling") or {}
+    counts = resampling.get("counts") or {}
+    used = sum(counts.values())
+    if used:
+        parts.append("hand delay {:.0f} ms, held newest on {:.1f}% of ticks".format(
+            resampling.get("delay_ms", 0.0), 100.0 * counts.get("held_newest", 0) / used))
+    return "timing (mean/p99): " + " | ".join(parts)
 
 
 def parse_args() -> argparse.Namespace:
@@ -867,6 +1014,12 @@ def parse_args() -> argparse.Namespace:
         choices=("curl-pinch", "dex", "legacy-curl", "off"),
         default=None,
         help="integrated only: Shadow-style curl-pinch (default), official dex, legacy curl, or safe-open/off",
+    )
+    parser.add_argument(
+        "--hand-delay-ms",
+        type=float,
+        default=None,
+        help="integrated only: fixed camera-hand delay behind each tick, 0-300 ms (default: config hand_target_delay_s)",
     )
     parser.add_argument(
         "--no-three-view",
@@ -896,9 +1049,15 @@ def parse_args() -> argparse.Namespace:
     if args.mode == "teleop" and (args.no_camera_display or args.camera_index != 0 or args.camera_no_mirror):
         parser.error("camera options apply only to integrated")
     if args.mode != "integrated" and (
-        args.hand_control is not None or args.no_three_view or args.viewer_smoke or args.headless_smoke or args.dex_smoke or args.record is not None
+        args.hand_control is not None or args.no_three_view or args.viewer_smoke or args.headless_smoke or args.dex_smoke
+        or args.record is not None or args.hand_delay_ms is not None
     ):
-        parser.error("--hand-control, --no-three-view, --viewer-smoke, --headless-smoke, and --dex-smoke apply only to integrated")
+        parser.error(
+            "--hand-control, --hand-delay-ms, --no-three-view, --viewer-smoke, --headless-smoke, and --dex-smoke "
+            "apply only to integrated"
+        )
+    if args.hand_delay_ms is not None and not 0.0 <= args.hand_delay_ms <= 300.0:
+        parser.error("--hand-delay-ms must be within 0-300")
     if args.viewer_smoke and args.headless:
         parser.error("--viewer-smoke requires a visible tri-view window; use --headless-smoke with --headless")
     if args.headless_smoke and not args.headless:
@@ -929,6 +1088,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config = WristConfig.load(args.config)
+    if args.hand_delay_ms is not None:
+        config = replace(config, hand_target_delay_s=args.hand_delay_ms / 1e3)
     if args.mode == "diagnostic":
         return run_diagnostic(config, args.duration)
     if args.mode == "integrated":

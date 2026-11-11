@@ -12,6 +12,14 @@ import threading
 import time
 from typing import Any, Callable
 
+# R presses this soon after a held reset ends are still dropped: they were
+# pressed while the picture was frozen, or reach us late from a busy window.
+RESET_RELEASE_GRACE_S = 0.5
+# Drawn across the main view while a reset runs (OpenCV text: ASCII only).
+RESET_NOTICE = "RESETTING - please wait\nR is ignored until the scene is back"
+# Longest wait for the notice to reach the screen before the reset blocks.
+RESET_NOTICE_WAIT_S = 0.15
+
 
 class KeyboardCommandRouter:
     """Convert R/Q callbacks into one-shot main-loop requests safely.
@@ -20,6 +28,10 @@ class KeyboardCommandRouter:
     A quiet interval therefore acts as release detection: auto-repeat updates
     the interval and cannot repeatedly reset an environment, while a later
     fresh press is accepted after the key has been quiet long enough.
+
+    ``hold_resets`` / ``release_resets`` drop R while a slow reset runs
+    (the windows keep reading keys while the control loop is blocked); Q is
+    never held.
     """
 
     def __init__(self, repeat_release_s: float = 0.25, clock: Callable[[], float] = time.monotonic):
@@ -30,6 +42,9 @@ class KeyboardCommandRouter:
         self._lock = threading.Lock()
         self._last_seen: dict[str, float] = {}
         self._reset_pending = False
+        self._reset_held = False
+        self._ignore_resets_until = float("-inf")
+        self._ignored_resets = 0
         self._stop_event = threading.Event()
         self._quit_reason: str | None = None
 
@@ -55,6 +70,9 @@ class KeyboardCommandRouter:
             if normalized == "r":
                 if self._stop_event.is_set():
                     return None
+                if self._reset_held or timestamp < self._ignore_resets_until:
+                    self._ignored_resets += 1
+                    return None
                 self._reset_pending = True
                 return "reset"
             self._stop_event.set()
@@ -67,6 +85,27 @@ class KeyboardCommandRouter:
             requested, self._reset_pending = self._reset_pending, False
             return requested
 
+    def hold_resets(self) -> None:
+        """Drop every R from now until ``release_resets`` (call as a slow reset starts)."""
+        with self._lock:
+            self._reset_held = True
+            self._reset_pending = False
+            self._ignored_resets = 0
+
+    def release_resets(self, grace_s: float = RESET_RELEASE_GRACE_S) -> int:
+        """Accept R again ``grace_s`` from now; returns how many R were dropped while held."""
+        with self._lock:
+            self._reset_held = False
+            self._reset_pending = False
+            self._ignore_resets_until = self._clock() + max(0.0, float(grace_s))
+            ignored, self._ignored_resets = self._ignored_resets, 0
+            return ignored
+
+    @property
+    def resets_held(self) -> bool:
+        with self._lock:
+            return self._reset_held
+
     @property
     def stop_event(self) -> threading.Event:
         return self._stop_event
@@ -75,6 +114,55 @@ class KeyboardCommandRouter:
     def quit_reason(self) -> str | None:
         with self._lock:
             return self._quit_reason
+
+
+class ResetFeedback:
+    """One R = one reset, and the reset is visible while it runs.
+
+    A LIBERO hard reset blocks the control loop for ~1.9 s and the first step
+    on the new model for another ~0.5 s while the last picture stays on
+    screen. The windows keep reading keys meanwhile, so an R pressed because
+    "nothing happens" used to queue one more reset (2026-11-07: four in a
+    row, 7.6 s frozen). ``begin`` (when the loop takes a reset) holds R and
+    puts a notice on the view; ``settle`` (after the first step on the new
+    model) removes it and accepts R again after ``grace_s``.
+    """
+
+    def __init__(self, keyboard: KeyboardCommandRouter, *, grace_s: float = RESET_RELEASE_GRACE_S) -> None:
+        self.keyboard = keyboard
+        self.grace_s = float(grace_s)
+        self._started: float | None = None
+        self._label = "reset"
+
+    @property
+    def active(self) -> bool:
+        return self._started is not None
+
+    def begin(self, view: Any = None, *, label: str = "reset", notice: str = RESET_NOTICE) -> None:
+        self.keyboard.hold_resets()
+        self._started, self._label = time.monotonic(), label
+        show = getattr(view, "show_notice", None)
+        if callable(show):
+            show(notice, wait_s=RESET_NOTICE_WAIT_S)
+        print("{}: please wait, R is ignored until the scene is back ...".format(label))
+
+    def settle(self, view: Any = None) -> dict[str, Any] | None:
+        """After the first step on the new model: the log record (``None`` if nothing was held)."""
+        if self._started is None:
+            return None
+        ignored = self.keyboard.release_resets(self.grace_s)
+        show = getattr(view, "show_notice", None)
+        if callable(show):
+            show(None)
+        now = time.monotonic()
+        record = {
+            "event": "reset_settled", "what": self._label, "held_s": now - self._started,
+            "ignored_r_presses": ignored, "r_grace_s": self.grace_s, "timestamp_monotonic_s": now,
+        }
+        self._started = None
+        print("{} done in {:.1f} s{}".format(
+            self._label, record["held_s"], " ({} extra R ignored)".format(ignored) if ignored else ""))
+        return record
 
 
 class CallbackMjviewerRenderer:

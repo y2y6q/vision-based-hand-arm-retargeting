@@ -90,8 +90,8 @@ def _ramp(t: float, t0: float, t1: float) -> float:
 def scripted_pose(t: float, start=np.array((0.0, 0.03, 0.50))) -> tuple[np.ndarray, np.ndarray]:
     """Smoke script (arm anchors after ~1.5 s: palm template warm-up + stable frames).
 
-    2.5-4.0 s right 10 cm; 4.0-4.5 s 6 cm toward the camera, held to 5.5 s
-    (depth rate control: the robot moves away), back to neutral by 6.0 s;
+    2.5-4.0 s right 10 cm; 4.0-4.5 s 6 cm toward the camera (the robot moves
+    away), held to 5.5 s (it stays), back by 6.0 s (it comes back);
     6.0-7.2 s up 6 cm; 7.2-8.6 s knob turn 25 deg (robot yaw); 9.0-9.6 s the
     hand moves back left 10 cm while the left-hand clutch is shown
     (``scripted_clutch``), so the robot must not follow.

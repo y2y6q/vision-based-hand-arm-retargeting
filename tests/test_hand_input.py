@@ -312,3 +312,76 @@ class HandInputTests(unittest.TestCase):
         worker.close()
         self.assertEqual(capture.release_calls, 1)
         self.assertFalse(worker.status()["capture_open"])
+
+    def test_frame_grabber_keeps_only_the_newest_frame(self):
+        from wrist_teleop.loop_timing import LatestSlot
+        import threading
+
+        class Capture:
+            def __init__(self):
+                self.reads = 0
+
+            def read(self):
+                self.reads += 1
+                time.sleep(0.002)
+                return True, np.full((2, 2, 3), self.reads, dtype=np.uint8)
+
+        worker = CameraHandWorker(HandInputAdapter(), display=False)
+        capture, slot, stop = Capture(), LatestSlot(), threading.Event()
+        grabber = threading.Thread(target=worker._grab_frames, args=(capture, slot, stop))
+        grabber.start()
+        time.sleep(0.2)  # a slow consumer: several frames arrive before the first take
+        ok, frame, timestamp, read_end = slot.take(timeout=1.0)
+        stop.set()
+        grabber.join(timeout=1.0)
+        self.assertFalse(grabber.is_alive())
+        self.assertTrue(ok)
+        self.assertGreaterEqual(slot.dropped, 3)
+        # The frame handed over is the newest one read at that moment, not the first queued.
+        self.assertGreaterEqual(int(frame[0, 0, 0]), 4)
+        self.assertTrue(slot.closed)
+        self.assertEqual(worker.status()["frames_read"], capture.reads)
+        self.assertIn("camera_read", worker.timing_snapshot())
+
+    def test_frame_grabber_failure_closes_the_slot_with_an_error(self):
+        from wrist_teleop.loop_timing import LatestSlot
+        import threading
+
+        class Capture:
+            def read(self):
+                raise OSError("device unplugged")
+
+        worker = CameraHandWorker(HandInputAdapter(), display=False)
+        slot = LatestSlot()
+        worker._grab_frames(Capture(), slot, threading.Event())
+        self.assertTrue(slot.closed)
+        self.assertIsNone(slot.take(timeout=0.0))
+        self.assertIn("device unplugged", worker._grab_error)
+
+    def test_hand_command_carries_the_frame_time_separately_from_the_query_time(self):
+        adapter = HandInputAdapter()
+        self.assertIsNone(adapter.latest(5.0).sample_timestamp_s)
+        adapter.update_landmarks(synthetic_hand(closed=False), timestamp_s=10.0)
+        command = adapter.latest(10.04)
+        self.assertEqual(command.timestamp_s, 10.04)
+        self.assertEqual(command.sample_timestamp_s, 10.0)
+
+    def test_worker_keeps_only_accepted_frames_as_resampling_samples(self):
+        worker = CameraHandWorker(HandInputAdapter(), display=False)
+        adapter = HandInputAdapter()
+        accepted = adapter.update_landmarks(synthetic_hand(closed=True), timestamp_s=10.0)
+        held = adapter.mark_lost(10.03, "no hand")  # legacy: invalid, last target kept
+        self.assertTrue(worker._record_sample(1.000, accepted))
+        self.assertFalse(worker._record_sample(1.033, held))
+        # A dex-style hold is still valid but repeats an older target.
+        dex_hold = HandCommand(
+            joint_targets=accepted.joint_targets, valid=True, timestamp_s=10.06, tracking_state="lost_hold",
+            calibration_state="x", curls=np.zeros(4),
+        )
+        self.assertFalse(worker._record_sample(1.066, dex_hold))
+        newest, samples = worker.samples_since(0)
+        self.assertEqual(newest, 1)
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0][0], 1.000)
+        np.testing.assert_allclose(samples[0][1], accepted.joint_targets)
+        self.assertEqual(worker.samples_since(newest), (1, []))

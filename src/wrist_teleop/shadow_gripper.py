@@ -31,6 +31,14 @@ SOURCE_MJCF = ASSET_ROOT / "right_hand.xml"
 SOURCE_MESH_ROOT = ASSET_ROOT / "assets"
 GRIPPER_TYPE = "ShadowHandRight"
 RIGID_TCP_GRIPPER_TYPE = "ShadowHandRightRigidTcp"
+DOWN_RIGID_TCP_GRIPPER_TYPE = "ShadowHandRightDownRigidTcp"
+# Hand mounts on the Panda flange. "forward": fingers along the gripper +x
+# axis, palm facing along the flange (at Panda's home pose the hand points
+# forward, palm down). "down": the same hand flexed 90 deg at the wrist, so the
+# fingers point along the flange (straight down at home) and the palm faces
+# the gripper -x axis (back toward the robot at home).
+SHADOW_MOUNTS = ("forward", "down")
+_DOWN_MOUNT_QUAT = np.array((np.sqrt(0.5), 0.0, -np.sqrt(0.5), 0.0))  # -90 deg about gripper y
 
 # The Menagerie hand includes a 213 mm forearm that is useful for a standalone
 # arm model but blocks tabletop grasping once the hand is already mounted on
@@ -46,6 +54,7 @@ PANDA_FLANGE_BODY = "robot0_link7"
 SHADOW_DIRECT_MOUNT_BODY = "rh_palm"
 SHADOW_PALM_CENTER_LOCAL = (0.0, -0.020, 0.050)
 SHADOW_PALMAR_NORMAL_LOCAL = (0.0, -1.0, 0.0)
+SHADOW_FINGER_AXIS_LOCAL = (0.0, 0.0, 1.0)  # rh_palm: knuckles at +z
 SHADOW_PALM_VIEW_CAMERA = "shadow_palm_view_camera"
 SHADOW_PALM_VIEW_OFFSET_M = 0.012
 
@@ -199,14 +208,17 @@ def _quat_rotate(quaternion_wxyz: np.ndarray, vector: Sequence[float]) -> np.nda
     return rotation @ np.asarray(vector, dtype=np.float64)
 
 
-def _robosuite_tree(rigid_tcp: bool = False) -> ET.ElementTree:
+def _robosuite_tree(rigid_tcp: bool = False, mount: str = "forward") -> ET.ElementTree:
     """Create an XML tree that robosuite 1.5.2 can prefix and merge.
 
     ``rigid_tcp`` places the generated ``eef`` body (and so the OSC control
     site) on the flange-fixed mount at its WRJ=0 pose instead of on
     ``rh_palm``. The palm sits behind Shadow's two softly actuated wrist
-    joints, which the arm OSC Jacobian cannot see.
+    joints, which the arm OSC Jacobian cannot see. ``mount`` is one of
+    ``SHADOW_MOUNTS``; it only turns the whole hand on the flange.
     """
+    if mount not in SHADOW_MOUNTS:
+        raise ValueError(f"Shadow mount must be one of {SHADOW_MOUNTS}, got {mount!r}")
     if not SOURCE_MJCF.is_file():
         raise FileNotFoundError(f"Shadow Hand MJCF is missing: {SOURCE_MJCF}")
     if not SOURCE_MESH_ROOT.is_dir():
@@ -215,6 +227,8 @@ def _robosuite_tree(rigid_tcp: bool = False) -> ET.ElementTree:
     root = tree.getroot()
     _inline_defaults(root)
     wrist = _remove_forearm_and_promote_wrist(root)
+    if mount == "down":
+        wrist.set("quat", _array_text(_quat_multiply(_DOWN_MOUNT_QUAT, _normalised_quat(wrist.get("quat")))))
     compiler = root.find("compiler")
     if compiler is not None:
         compiler.attrib.pop("meshdir", None)
@@ -309,12 +323,12 @@ def _robosuite_tree(rigid_tcp: bool = False) -> ET.ElementTree:
     return tree
 
 
-def _temporary_mjcf_path(rigid_tcp: bool = False) -> Path:
+def _temporary_mjcf_path(rigid_tcp: bool = False, mount: str = "forward") -> Path:
     handle = tempfile.NamedTemporaryFile(prefix="shadow_hand_right_", suffix=".xml", delete=False)
     path = Path(handle.name)
     handle.close()
     try:
-        _robosuite_tree(rigid_tcp).write(path, encoding="unicode", xml_declaration=True)
+        _robosuite_tree(rigid_tcp, mount).write(path, encoding="unicode", xml_declaration=True)
     except Exception:
         path.unlink(missing_ok=True)
         raise
@@ -365,6 +379,7 @@ def register_shadow_gripper() -> str:
 
     GRIPPER_MAPPING[GRIPPER_TYPE] = ShadowHandRight
     GRIPPER_MAPPING[RIGID_TCP_GRIPPER_TYPE] = ShadowHandRightRigidTcp
+    GRIPPER_MAPPING[DOWN_RIGID_TCP_GRIPPER_TYPE] = ShadowHandRightDownRigidTcp
     return GRIPPER_TYPE
 
 
@@ -379,12 +394,13 @@ class ShadowHandRight(GripperModel):
     actuator_names = SHADOW_ACTUATOR_NAMES
 
     rigid_tcp = False
+    hand_mount = "forward"
 
     def __init__(self, idn: int | str = 0):
-        tree = _robosuite_tree(self.rigid_tcp)
+        tree = _robosuite_tree(self.rigid_tcp, self.hand_mount)
         self.lower_limits, self.upper_limits = _actuator_ranges_from_tree(tree)
         self._init_qpos = _joint_initial_qpos_from_tree(tree)
-        path = _temporary_mjcf_path(self.rigid_tcp)
+        path = _temporary_mjcf_path(self.rigid_tcp, self.hand_mount)
         try:
             super().__init__(str(path), idn=idn)
         finally:
@@ -454,12 +470,22 @@ class ShadowHandRight(GripperModel):
     def horizontal_radius(self) -> float:
         return 0.18
 
+    @property
+    def laser_direction_local(self) -> tuple[float, float, float]:
+        """Palm-frame aim of the targeting laser: where the hand grasps from."""
+        return SHADOW_FINGER_AXIS_LOCAL if self.hand_mount == "down" else SHADOW_PALMAR_NORMAL_LOCAL
+
     def describe(self) -> dict[str, Any]:
+        if self.rigid_tcp:
+            gripper_type = DOWN_RIGID_TCP_GRIPPER_TYPE if self.hand_mount == "down" else RIGID_TCP_GRIPPER_TYPE
+        else:
+            gripper_type = GRIPPER_TYPE
         return {
-            "gripper_type": RIGID_TCP_GRIPPER_TYPE if self.rigid_tcp else GRIPPER_TYPE,
+            "gripper_type": gripper_type,
             "osc_tcp_parent": "flange-fixed mount (WRJ=0 pose)" if self.rigid_tcp else "rh_palm",
             "source_mjcf": str(self.source_mjcf),
             "mount": "direct Panda flange -> rh_wrist (rh_forearm removed)",
+            "hand_mount": self.hand_mount,
             "removed_forearm_length_m": SHADOW_FOREARM_REMOVED_LENGTH_M,
             "mount_collision_exclusion": {
                 "body1": PANDA_FLANGE_BODY,
@@ -481,6 +507,12 @@ class ShadowHandRightRigidTcp(ShadowHandRight):
     """Same hand and action contract; OSC TCP fixed to the Panda flange."""
 
     rigid_tcp = True
+
+
+class ShadowHandRightDownRigidTcp(ShadowHandRightRigidTcp):
+    """Same hand, action contract and rigid TCP; fingers along the flange (down at home)."""
+
+    hand_mount = "down"
 
 
 def make_shadow_panda_env(

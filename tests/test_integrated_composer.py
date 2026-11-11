@@ -103,6 +103,41 @@ class IntegratedComposerTests(unittest.TestCase):
                                    self.composer.compose(wrist, None)[self.composer.arm_slice])
         np.testing.assert_allclose(with_button[self.composer.hand_slice], hand_only[self.composer.hand_slice])
 
+    def test_pure_rotation_neither_pushes_the_hand_nor_creeps_after_release(self):
+        """Regression for the 2026-11-05 yaw / roll drift (split OSC inertia blocks)."""
+
+        self.assertFalse(self.composer.controller.uncoupling)
+        rate = 0.025  # rad per tick, 0.5 rad/s like the logged sessions
+        axes = (np.array((0.0, 0.0, 1.0)), np.array((0.816, 0.578, 0.0)), np.array((0.578, -0.816, 0.0)))
+        for axis in axes:
+            for sign in (1.0, -1.0):
+                with self.subTest(axis=axis.tolist(), sign=sign):
+                    self.env.reset()
+                    composer = PandaAllegroActionComposer(self.env)
+                    composer.initialize_goal()
+                    for _ in range(15):
+                        self.env.step(composer.compose(np.zeros(6), None))
+                    composer.initialize_goal()
+                    p0, r0 = np.array(composer.controller.ref_pos), np.array(composer.controller.ref_ori_mat)
+                    for _ in range(30):
+                        self.env.step(composer.compose(np.concatenate((np.zeros(3), sign * rate * axis)), None))
+                    p1 = np.array(composer.controller.ref_pos)
+                    trail = []
+                    for _ in range(40):
+                        self.env.step(composer.compose(np.zeros(6), None))
+                        trail.append((np.array(composer.controller.ref_pos), np.array(composer.controller.ref_ori_mat)))
+                    p2, r2 = trail[-1]
+                    p_late, r_late = trail[-11]
+                    self.assertGreater(_angle_deg(r0, r2), 30.0)
+                    self.assertLess(np.linalg.norm(p1 - p0), 0.005)
+                    self.assertLess(np.linalg.norm(p2 - p1), 0.001)
+                    self.assertLess(np.linalg.norm(p2 - p_late), 1e-4)
+                    self.assertLess(_angle_deg(r_late, r2), 0.05)
+
+
+def _angle_deg(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.degrees(np.arccos(np.clip((np.trace(a.T @ b) - 1.0) / 2.0, -1.0, 1.0))))
+
 
 if __name__ == "__main__":
     unittest.main()

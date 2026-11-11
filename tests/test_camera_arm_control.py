@@ -108,20 +108,17 @@ class MappingTests(unittest.TestCase):
         self.assertGreater(up[2], 0.04)
         self.assertAlmostEqual(up[0], fast[0], delta=0.003)
 
-    def test_depth_is_rate_controlled_with_a_deadzone(self):
+    def test_depth_follows_the_hand_and_a_held_hand_holds(self):
         runner = _Runner()
         runner.run(seconds=2.0)
-        inside = runner.run(offset=(0.0, 0.02, 0.0), seconds=1.5, ramp_s=0.3).target_pos
-        self.assertAlmostEqual(inside[1], 0.0, delta=0.002)  # inside the deadzone: no motion
-        half = runner.run(offset=(0.0, 0.07, 0.0), seconds=1.0, ramp_s=0.3).target_pos  # nearer -> away
-        held = runner.run(seconds=1.0).target_pos
-        self.assertGreater(half[1], 0.01)
-        self.assertGreater(held[1], half[1] + 0.02)  # keeps moving while held
-        back = runner.run(offset=(0.0, 0.0, 0.0), seconds=1.0, ramp_s=0.3).target_pos
-        rest = runner.run(seconds=1.5).target_pos
-        self.assertAlmostEqual(rest[1], back[1], delta=0.002)  # neutral again: stops
-        farther = runner.run(offset=(0.0, -0.08, 0.0), seconds=1.5, ramp_s=0.3).target_pos
-        self.assertLess(farther[1], rest[1] - 0.02)  # farther -> comes back
+        nearer = runner.run(offset=(0.0, 0.06, 0.0), seconds=1.0, ramp_s=0.4).target_pos  # nearer -> away
+        self.assertGreater(nearer[1], 0.04)
+        held = runner.run(seconds=2.0).target_pos  # held there: the arm stays (no rate control)
+        self.assertAlmostEqual(held[1], nearer[1], delta=0.002)
+        back = runner.run(offset=(0.0, 0.0, 0.0), seconds=1.0, ramp_s=0.4).target_pos  # back -> back
+        self.assertAlmostEqual(back[1], 0.0, delta=0.01)
+        farther = runner.run(offset=(0.0, -0.06, 0.0), seconds=1.5, ramp_s=1.2).target_pos
+        self.assertLess(farther[1], back[1] - 0.02)
         np.testing.assert_allclose(farther[[0, 2]], 0.0, atol=0.004)
 
     def test_still_hand_does_not_move_the_target(self):
@@ -171,6 +168,24 @@ class MappingTests(unittest.TestCase):
         self.assertFalse(runner.mapper.toggle_pause())
         status = runner.run(seconds=0.5)
         np.testing.assert_allclose(status.target_pos, runner.robot_pos, atol=0.003)
+
+    def test_resume_waits_for_the_hand_to_settle(self):
+        runner = _Runner()
+        runner.run(seconds=2.0)
+        runner.robot_pos = np.array((0.05, 0.0, 0.0))
+        runner.mapper.toggle_pause()
+        runner.run(offset=(0.10, 0.06, 0.0), seconds=0.4, ramp_s=1.6)  # repositioning during the pause
+        runner.mapper.toggle_pause()
+        # Resumed while the hand is still moving into place (right and nearer):
+        # the arm does not follow that motion ...
+        moving = runner.run(offset=(0.10, 0.06, 0.0), seconds=0.6, ramp_s=0.8)
+        self.assertEqual(moving.state, "anchoring")  # no target: the loop commands nothing
+        # ... and starts from where it is once the hand has settled.
+        settled = runner.run(seconds=1.0)
+        self.assertEqual(settled.state, "tracking")
+        np.testing.assert_allclose(settled.target_pos, runner.robot_pos, atol=0.003)
+        followed = runner.run(offset=(0.10, 0.06, 0.05), seconds=1.0, ramp_s=0.5).target_pos
+        self.assertGreater(followed[2], runner.robot_pos[2] + 0.02)  # then follows as usual
 
     def test_whole_palm_rotation_is_followed(self):
         runner = _Runner()
@@ -254,16 +269,12 @@ class MappingTests(unittest.TestCase):
 
 
 class SettingsTests(unittest.TestCase):
-    def test_gain_curve_and_depth_rate(self):
+    def test_gain_curve(self):
         s = CameraArmSettings()
         self.assertAlmostEqual(s.speed_gain(0.0), s.slow_gain)
         self.assertAlmostEqual(s.speed_gain(1.0), s.fast_gain)
         speeds = np.linspace(0.0, 0.2, 21)
         self.assertTrue(np.all(np.diff([s.speed_gain(v) for v in speeds]) >= 0.0))
-        self.assertEqual(s.depth_rate(0.5 * s.depth_deadzone_m), 0.0)
-        self.assertGreater(s.depth_rate(s.depth_deadzone_m + 0.02), 0.0)
-        self.assertLess(s.depth_rate(-s.depth_deadzone_m - 0.02), 0.0)
-        self.assertAlmostEqual(s.depth_rate(1.0), s.depth_max_speed_m_s)
 
 
 class OperatorViewTests(unittest.TestCase):
