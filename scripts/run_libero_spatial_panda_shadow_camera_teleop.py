@@ -1,18 +1,21 @@
-"""Camera-only teleoperation of an official LIBERO Spatial scene: Panda + Shadow Hand.
+"""Camera-only teleoperation of an official LIBERO scene (Spatial by default, ``--suite`` for others): Panda + Shadow Hand.
 
 No SpaceMouse. Your RIGHT hand in front of the webcam drives everything:
 
-* move it left / right, up / down: the end effector follows like a mouse
-  pointer (slow motion = fine, fast motion = farther);
-* hold it nearer the camera than where it started: the end effector moves
-  away at a speed set by how much nearer; farther: it comes back; in between
-  (the deadzone shown on the depth gauge) it stays;
+* move it left / right, up / down, toward / away from the camera: the end
+  effector follows like a mouse pointer (slow motion = fine, fast motion =
+  farther); a still hand keeps the arm still;
 * turn or tilt it: the end effector follows the palm's rotation (only
   while the hand is not translating);
 * the fingers are retargeted to the Shadow Hand (DexPilot by default).
 
 Show your LEFT hand next to the right one to clutch: the arm holds while you
-reposition the right hand. Run only with ``.venv-libero``.
+reposition the right hand. After a pause or a lost hand, hold the hand still
+for a moment ("HOLD STILL"): the arm then continues from where it is.
+``--hand-mount down`` turns the hand so the fingers point down;
+``--object-mass-scale`` makes the task objects heavier.
+``--thumb-lift-gain`` scales how far the thumb lifts off the palm (camera depth is compressed).
+Run only with ``.venv-libero``.
 
 Keys: C pause / resume, - / = arm gain, R reset, Q quit.
 """
@@ -29,12 +32,18 @@ sys.path.insert(0, str(ROOT / "src"))
 from wrist_teleop.camera_arm_control import CameraArmSettings  # noqa: E402
 from wrist_teleop.config import WristConfig  # noqa: E402
 from wrist_teleop.libero_camera_teleop import run_libero_camera_teleop  # noqa: E402
+from wrist_teleop.libero_spatial_teleop import LIBERO_SUITES, OBJECT_MASS_SCALE_RANGE  # noqa: E402
+from wrist_teleop.libero_views import parse_view_size  # noqa: E402
+from wrist_teleop.shadow_dex import SHADOW_THUMB_LIFT_GAIN_RANGE  # noqa: E402
+from wrist_teleop.shadow_gripper import SHADOW_MOUNTS  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     defaults = CameraArmSettings()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path, default=ROOT / "configs" / "spacemouse_wrist.json")
+    parser.add_argument("--suite", choices=LIBERO_SUITES, default="libero_spatial",
+                        help="official task suite; --task-id picks a task inside it")
     parser.add_argument("--task-id", type=int, default=0)
     parser.add_argument("--task-order", type=int, default=0)
     parser.add_argument("--init-state-id", type=int, default=0)
@@ -45,9 +54,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hand-control", choices=("dex", "legacy-curl", "off"), default="dex",
                         help="finger mapping; the arm always follows the wrist")
     parser.add_argument("--gain", type=float, default=defaults.translation_gain,
-                        help="multiplier on the speed-dependent left/right and up/down gain")
+                        help="multiplier on the speed-dependent translation gain (all directions)")
     parser.add_argument("--depth-gain", type=float, default=defaults.depth_gain,
-                        help="robot m/s per metre of hand offset from the neutral depth (beyond the deadzone)")
+                        help="extra factor on toward / away from the camera, relative to the other directions")
     parser.add_argument("--rotation-gain", type=float, default=defaults.rotation_gain)
     parser.add_argument("--camera-fov", type=float, default=65.0,
                         help="webcam horizontal field of view in degrees (sets the depth scale)")
@@ -58,7 +67,24 @@ def parse_args() -> argparse.Namespace:
                         help="windows on; scripted synthetic hand instead of the webcam")
     parser.add_argument("--duration", type=float, default=None)
     parser.add_argument("--no-three-view", action="store_true")
+    parser.add_argument("--dex-official", action="store_true",
+                        help="unmodified official DexPilot (without the project mapping terms)")
+    parser.add_argument("--thumb-lift-gain", type=float, default=None,
+                        help="multiply the thumb's lift off the palm as the camera sees it "
+                             "({:g}-{:g}; default 1.5 from shadow_grasp_terms.json, 1 = as measured)".format(
+                                 *SHADOW_THUMB_LIFT_GAIN_RANGE))
+    parser.add_argument("--hand-mount", choices=SHADOW_MOUNTS, default="forward",
+                        help="forward: fingers forward, palm down (default); down: fingers point down")
+    parser.add_argument("--object-mass-scale", type=float, default=1.0,
+                        help="multiply every task object's mass ({:g}-{:g}; 1 = official)".format(*OBJECT_MASS_SCALE_RANGE))
+    parser.add_argument("--view-size", type=parse_view_size, default=None, metavar="WxH",
+                        help="simulator window size in pixels (default: fill the primary monitor)")
     args = parser.parse_args()
+    if args.thumb_lift_gain is not None:
+        if args.dex_official:
+            parser.error("--thumb-lift-gain belongs to the project mapping; drop --dex-official")
+        if not SHADOW_THUMB_LIFT_GAIN_RANGE[0] <= args.thumb_lift_gain <= SHADOW_THUMB_LIFT_GAIN_RANGE[1]:
+            parser.error("--thumb-lift-gain must be within {:g}-{:g}".format(*SHADOW_THUMB_LIFT_GAIN_RANGE))
     if args.duration is not None and args.duration <= 0:
         parser.error("--duration must be positive")
     if args.headless_smoke and not args.headless:
@@ -90,7 +116,10 @@ def main() -> int:
         camera_index=args.camera_index, camera_display=not args.no_camera_display,
         camera_mirror=not args.camera_no_mirror,
         hand_control="off" if smoke and args.hand_control == "dex" else args.hand_control,
-        synthetic_hand=smoke, three_view=not args.no_three_view,
+        synthetic_hand=smoke, three_view=not args.no_three_view, suite=args.suite,
+        hand_mount=args.hand_mount, object_mass_scale=args.object_mass_scale, view_size=args.view_size,
+        dex_grasp_terms=not args.dex_official,
+        thumb_lift_gain=args.thumb_lift_gain,
     )
 
 

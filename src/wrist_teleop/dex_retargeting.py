@@ -27,6 +27,8 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from .loop_timing import RollingStats
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 OFFICIAL_DEX_VERSION = "0.4.6"
@@ -246,6 +248,7 @@ class _DexSidecar:
                 f"could not start dex sidecar with {self.python_path}: {type(exc).__name__}: {exc}"
             ) from exc
 
+        self.retarget_timing = RollingStats()
         self._responses: queue.Queue[dict[str, Any]] = queue.Queue()
         self._stdout_tail: deque[str] = deque(maxlen=16)
         self._stderr_tail: deque[str] = deque(maxlen=32)
@@ -341,15 +344,25 @@ class _DexSidecar:
         """Send one atomic request; retarget/reset/close cannot cross responses."""
 
         with self._request_lock:
-            return self._request_locked(operation, timeout_s=timeout_s, **payload)
+            if operation != "retarget":
+                return self._request_locked(operation, timeout_s=timeout_s, **payload)
+            # Round trip: JSON encode, pipe, solve in the child, pipe back.
+            start = time.perf_counter()
+            result = self._request_locked(operation, timeout_s=timeout_s, **payload)
+            end = time.perf_counter()
+            self.retarget_timing.add(end - start, end)
+            return result
 
-    def initialize(self, *, config_path: Path, urdf_root: Path) -> dict[str, Any]:
+    def initialize(self, *, config_path: Path, urdf_root: Path,
+                   grasp_terms: dict[str, Any] | None = None) -> dict[str, Any]:
+        extra = {} if grasp_terms is None else {"grasp_terms": grasp_terms}
         return self.request(
             "init",
             timeout_s=DEX_SIDECAR_INIT_TIMEOUT_S,
             wheel_path=str(OFFICIAL_WHEEL.resolve()),
             config_path=str(config_path.resolve()),
             urdf_root=str(urdf_root.resolve()),
+            **extra,
         )
 
     def close(self) -> None:
@@ -632,6 +645,12 @@ class DexRetargetingAdapter:
                     reset_filter()
         except Exception as exc:
             raise RuntimeError(f"official dex reset failed: {type(exc).__name__}: {exc}") from exc
+
+    def timing_snapshot(self) -> dict[str, Any]:
+        """Sidecar retarget round-trip latency / rate (empty for the native runtime)."""
+
+        sidecar = self._sidecar
+        return {} if sidecar is None else {"sidecar_retarget_roundtrip": sidecar.retarget_timing.snapshot()}
 
     def close(self) -> None:
         """Release the isolated solver after the camera worker has stopped."""

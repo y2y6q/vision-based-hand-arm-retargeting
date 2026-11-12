@@ -1,0 +1,10 @@
+{
+  "version": 3,
+  "description": "Project mapping on top of official DexPilot for Shadow (see scripts/dex_retargeting_worker.py, comment above GRASP_TERM_DEFAULTS). Posture terms: operator thumb segments / finger proximal + middle phalanges as direction targets. thumb_lift_gain multiplies the thumb's offset from the operator's palm plane (camera depth is compressed). finger_length_scaling scales each finger by robot / operator chain length so a straight finger maps to a straight finger. Pinch: robot thumb-finger distance = 1.2 * max(0, d - pinch_gap_m), no snap threshold, where d is the operator's thumb-finger tip-landmark distance. pinch_points 'pads' measures the robot distance between points on the Shadow distal pads (0 = pad contact) instead of the fingertip frames, which sit ~5 mm inside the fingertips. pinch_gap_m 0.022: tip-landmark distance when the operator's pads touch (real sessions 2026-11-05: pinch frames 2.16-2.4 cm). Every term reads only the operator's landmarks in the current frame.",
+  "thumb_segment_weights": [3.0, 3.0, 3.0],
+  "finger_segment_weights": [1.0, 0.5],
+  "thumb_lift_gain": 1.5,
+  "finger_length_scaling": true,
+  "pinch_gap_m": 0.022,
+  "pinch_points": "pads"
+}

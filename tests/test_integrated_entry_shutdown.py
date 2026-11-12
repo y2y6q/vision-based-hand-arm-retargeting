@@ -191,6 +191,23 @@ class IntegratedEntryShutdownTests(unittest.TestCase):
         self.assertEqual(len(self.close_calls), 1)
         self.assertTrue(retargeter.closed)
 
+    def test_dex_input_unmirrors_camera_and_feeds_full_size_landmarks(self):
+        captured = {}
+
+        class RecordingRetargeter:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        config = WristConfig.load(ROOT / "configs" / "spacemouse_wrist.json")
+        with patch.object(ENTRY, "DexRetargetingAdapter", RecordingRetargeter):
+            mirrored, _ = ENTRY._make_hand_input(config, "dex", camera_mirror=True)
+            plain, _ = ENTRY._make_hand_input(config, "dex", camera_mirror=False)
+        # The solver works on the full-size Allegro URDF: no 2/3 landmark shrink.
+        self.assertNotIn("reference_landmark_scale", captured)
+        self.assertTrue(mirrored.unmirror_world_x)
+        self.assertFalse(plain.unmirror_world_x)
+        self.assertFalse(mirrored.relative_motion)
+
     def test_q_routes_to_unified_cleanup_and_exits_zero(self):
         device = FakeDevice(self.config)
         router = KeyboardCommandRouter()
@@ -201,6 +218,35 @@ class IntegratedEntryShutdownTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(len(self.close_calls), 1)
         self.assertEqual(MemoryLog.instances[-1].events[-1]["reason"], "test:Q")
+
+    def test_r_reset_restarts_the_tick_grid_then_q_still_exits_cleanly(self):
+        device = FakeDevice(self.config)
+        router = KeyboardCommandRouter()
+        router.feed("r", source="test", timestamp_s=1.0)
+        reset_calls = []
+
+        def reset_then_quit(*args, **kwargs):
+            reset_calls.append(kwargs.get("gestures"))
+            if len(reset_calls) == 2:  # the R reset; startup is the first call
+                router.feed("q", source="test", timestamp_s=2.0)
+            return self._reset_result(*args, **kwargs)
+
+        patches = self._patches(device) + (
+            patch.object(ENTRY, "KeyboardCommandRouter", lambda: router),
+            patch.object(ENTRY, "reset_integrated_environment", reset_then_quit),
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[7], patches[8], patches[9]:
+            result = ENTRY.run_integrated(self.config, True, 5.0, 0, False, hand_control="legacy-curl")
+        self.assertEqual(result, 0)
+        self.assertEqual(len(reset_calls), 2)
+        self.assertEqual(len(self.close_calls), 1)
+        events = MemoryLog.instances[-1].events
+        self.assertIn("R", [event.get("reason") for event in events if event.get("event") == "environment_reset"])
+        self.assertEqual(events[-1]["reason"], "test:Q")
+        exit_timing = [event for event in events if event.get("event") == "timing_summary"][-1]
+        self.assertEqual(exit_timing["reason"], "exit")
+        self.assertEqual(exit_timing["clock"]["period_ms"], 1e3 / self.config.control_hz)
+        self.assertEqual(exit_timing["clock"]["overruns_dropped_ticks"], 0)
 
 
 if __name__ == "__main__":

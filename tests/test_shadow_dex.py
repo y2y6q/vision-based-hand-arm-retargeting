@@ -17,6 +17,7 @@ from wrist_teleop.shadow_dex import (  # noqa: E402
     SHADOW_DEX_CONFIG,
     SHADOW_DEX_JOINT_NAMES,
     SHADOW_DEX_URDF_ROOT,
+    SHADOW_THUMB_LIFT_GAIN_RANGE,
     ShadowDexHandInput,
     shadow_targets_from_dex,
 )
@@ -122,6 +123,40 @@ class ShadowDexHandInputTests(unittest.TestCase):
     def test_normalized_image_landmarks_are_rejected(self):
         adapter = ShadowDexHandInput(_FakeShadowRetargeter(), LOWER, UPPER)
         self.assertFalse(adapter.update_landmarks(_landmarks(), timestamp_s=1.0).valid)
+
+    def test_details_log_the_solver_landmarks_and_mapping(self):
+        fake = _FakeShadowRetargeter()
+        fake.last_mapping = {"finger_scales": [1.2, 1.1, 1.05, 1.08, 1.22]}
+        adapter = ShadowDexHandInput(fake, LOWER, UPPER, unmirror_world_x=False)
+        details = adapter.update_world_landmarks(_landmarks(), "Right", timestamp_s=1.0).details
+        np.testing.assert_allclose(details["mano_landmarks"], fake.inputs[-1], atol=1e-5)
+        self.assertEqual(details["dex_mapping"], fake.last_mapping)
+
+    def test_thumb_lift_gain_bounds_match_the_worker(self):
+        self.assertEqual(SHADOW_THUMB_LIFT_GAIN_RANGE, worker.THUMB_LIFT_GAIN_RANGE)
+
+    def test_pinch_pad_points_lie_on_the_mujoco_distal_collision_pads(self):
+        # The worker's pad points (offsets in the URDF distal frames, which
+        # hold the meshes the same way as the MJCF distal bodies) must sit on
+        # the palmar surface the simulator collides, not inside the finger
+        # like the official fingertip frames.
+        import mujoco
+
+        model = mujoco.MjModel.from_xml_path(str(ROOT / "assets" / "shadow_hand" / "right_hand.xml"))
+        data = mujoco.MjData(model)
+        mujoco.mj_kinematics(model, data)
+        collision_only = np.array([0, 0, 0, 1, 0, 0], dtype=np.uint8)
+        geom_id = np.zeros(1, dtype=np.int32)
+        self.assertEqual(set(worker._SHADOW_PAD_POINTS), {"thtip", "fftip", "mftip", "rftip", "lftip"})
+        for distal, _pad, offset in worker._SHADOW_PAD_POINTS.values():
+            body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "rh_" + distal)
+            rotation = data.xmat[body].reshape(3, 3)
+            pad = data.xpos[body] + rotation @ np.asarray(offset)
+            # Cast from 1 cm out on the palmar (-y) side back toward the pad.
+            start = pad - rotation[:, 1] * 0.01
+            hit = mujoco.mj_ray(model, data, start, rotation[:, 1], collision_only, 1, -1, geom_id)
+            self.assertEqual(model.geom_bodyid[geom_id[0]], body, distal)
+            self.assertAlmostEqual(hit, 0.01, delta=0.0008, msg=distal)
 
 
 class _FakeDexPilot:

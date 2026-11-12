@@ -408,6 +408,7 @@ class TriViewCompositor:
         before_time = self._state_time(sim)
         frames: dict[str, np.ndarray] = {}
         panel_sizes = self.config.panel_sizes
+        render_started = time.perf_counter()
         try:
             for view, camera_name in _camera_frames(self.config):
                 if self.laser is not None:
@@ -440,6 +441,7 @@ class TriViewCompositor:
             int(frames[view].shape[:2] != (int(size[1]), int(size[0])))
             for view, size in panel_sizes.items()
         )
+        compose_started = time.perf_counter()
         frame = self._compose(frames, status_text)
         wrist_laser_aim_overlay = self._overlay_wrist_laser_aim(frame)
         overlay_error = None
@@ -449,10 +451,12 @@ class TriViewCompositor:
             except Exception as exc:
                 # Annotations are optional; never stop the control loop for them.
                 overlay_error = f"{type(exc).__name__}: {exc}"
-        self.last_frames = {name: image.copy() for name, image in frames.items()}
-        self.last_frame = frame.copy()
+        self.last_frames = frames
+        self.last_frame = frame
         self._last_render_at = now
+        show_started = time.perf_counter()
         key, action, gui_error = self._show(frame)
+        show_finished = time.perf_counter()
         record = self._base_record(sim, rendered=True)
         record.update(
             {
@@ -478,6 +482,11 @@ class TriViewCompositor:
                 ),
                 "key": key,
                 "wrist_laser_aim_overlay": wrist_laser_aim_overlay,
+                "timing_ms": {
+                    "render": 1e3 * (compose_started - render_started),
+                    "compose": 1e3 * (show_started - compose_started),
+                    "show": 1e3 * (show_finished - show_started),
+                },
             }
         )
         if action is not None:

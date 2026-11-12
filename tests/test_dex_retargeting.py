@@ -172,6 +172,41 @@ class DexRetargetingTests(unittest.TestCase):
         self.assertFalse(adapter.recenter_relative_motion())
         self.assertEqual(adapter.calibration_state, "absolute official dex vector target")
 
+    def test_unmirror_restores_unflipped_geometry_before_mano(self):
+        """A horizontally flipped camera frame must reach the solver as a right hand."""
+
+        class RecordingSolver(FakeRetargeter):
+            def __init__(self):
+                super().__init__()
+                self.inputs = []
+
+            def retarget(self, mano):
+                self.inputs.append(np.array(mano))
+                return super().retarget(mano)
+
+        def run(points, unmirror):
+            solver = RecordingSolver()
+            adapter = DexHandInputAdapter(
+                solver, lower_limits=np.array([-2.0] * 16), upper_limits=np.array([2.0] * 16),
+                joint_names=tuple(f"joint_{index}.0" for index in range(16)), relative_motion=False,
+                unmirror_world_x=unmirror,
+            )
+            return adapter.update_world_landmarks(points, "Right", timestamp_s=1.0), solver.inputs[-1]
+
+        flipped = [Landmark(-point.x, point.y, point.z) for point in hand()]
+        command, restored = run(flipped, True)
+        _, reference = run(hand(), False)
+        _, mirror_shape = run(flipped, False)
+        self.assertTrue(command.valid)
+        self.assertTrue(command.details["unmirror_world_x"])
+        np.testing.assert_allclose(restored, reference, atol=1e-12)
+        # Without un-mirroring the solver sees a reflected (left-hand) shape.
+        self.assertFalse(np.allclose(mirror_shape, reference))
+
+    def test_shipped_config_uses_absolute_dex_targets(self):
+        config = WristConfig.load(Path(__file__).resolve().parents[1] / "configs" / "spacemouse_wrist.json")
+        self.assertFalse(config.dex_hand.relative_motion)
+
     def test_detector_loss_holds_once_then_expires_to_safe_open_policy(self):
         adapter = DexHandInputAdapter(
             FakeRetargeter(),

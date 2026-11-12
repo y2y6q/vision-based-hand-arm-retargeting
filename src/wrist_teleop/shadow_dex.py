@@ -10,10 +10,22 @@ config keeps Shadow's WRJ2 / WRJ1 out of the optimization (held at zero).
 The dex-urdf Shadow URDF and the MuJoCo Menagerie MJCF share joint names,
 signs and limits (fingertip geometry agrees to 0.1 mm), so targets map by
 name. The four distal tendon actuators take ``J2 + J1``.
+
+By default the sidecar adds the project mapping
+(``configs/dex_retargeting/shadow_grasp_terms.json``): the operator's thumb
+and finger segment directions as posture targets, a gain on the thumb's lift
+off the palm (camera depth is compressed), per-finger length scaling (a
+straight finger maps to a straight finger) and a continuous thumb-finger
+distance mapping instead of the official pinch snap, measured between points
+on the Shadow finger pads (``pinch_points``), where a human pinch touches,
+rather than the fingertip frames inside the fingertips. It reads only the
+operator's hand. ``grasp_terms_path=None`` runs the unmodified official
+DexPilot.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import threading
 import time
@@ -40,6 +52,7 @@ from .shadow_gripper import SHADOW_ACTUATOR_NAMES
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SHADOW_DEX_CONFIG = PROJECT_ROOT / "configs" / "dex_retargeting" / "shadow_hand_right_dexpilot.yml"
 SHADOW_DEX_URDF_ROOT = PROJECT_ROOT / "third_party" / "dex_urdf"
+SHADOW_GRASP_TERMS = PROJECT_ROOT / "configs" / "dex_retargeting" / "shadow_grasp_terms.json"
 SHADOW_DEX_JOINT_NAMES = frozenset((
     "WRJ2", "WRJ1",
     "FFJ4", "FFJ3", "FFJ2", "FFJ1", "MFJ4", "MFJ3", "MFJ2", "MFJ1",
@@ -48,6 +61,9 @@ SHADOW_DEX_JOINT_NAMES = frozenset((
 ))
 # Five fingertips -> 10 tip pairs + 5 wrist-to-tip vectors.
 SHADOW_DEX_VECTOR_COUNT = 15
+# Same bounds as THUMB_LIFT_GAIN_RANGE in scripts/dex_retargeting_worker.py
+# (the worker imports nothing from the project).
+SHADOW_THUMB_LIFT_GAIN_RANGE = (0.5, 4.0)
 
 
 def _mainline_sidecar_python() -> Optional[Path]:
@@ -104,9 +120,23 @@ class ShadowDexRetargeter:
         config_path: Path = SHADOW_DEX_CONFIG,
         urdf_root: Path = SHADOW_DEX_URDF_ROOT,
         sidecar_python: Optional[Path] = None,
+        grasp_terms_path: Optional[Path] = SHADOW_GRASP_TERMS,
+        thumb_lift_gain: Optional[float] = None,
     ) -> None:
         self.config_path = Path(config_path)
         self.urdf_root = Path(urdf_root)
+        self.grasp_terms_path = None if grasp_terms_path is None else Path(grasp_terms_path)
+        self.last_mapping: Optional[dict[str, Any]] = None
+        grasp_terms = None
+        if self.grasp_terms_path is not None:
+            try:
+                grasp_terms = json.loads(self.grasp_terms_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise DexRetargetingUnavailable(f"Shadow grasp terms are unreadable: {self.grasp_terms_path}: {exc}") from exc
+        if thumb_lift_gain is not None:
+            if grasp_terms is None:
+                raise ValueError("thumb_lift_gain is part of the project grasp terms; official DexPilot has none")
+            grasp_terms["thumb_lift_gain"] = float(thumb_lift_gain)
         if not self.config_path.is_file():
             raise DexRetargetingUnavailable(f"Shadow dex config is missing: {self.config_path}")
         if not (self.urdf_root / "shadow_hand" / "shadow_hand_right.urdf").is_file():
@@ -119,7 +149,8 @@ class ShadowDexRetargeter:
         self._lock = threading.RLock()
         self._sidecar: Optional[_DexSidecar] = _DexSidecar(python_path)
         try:
-            metadata = self._sidecar.initialize(config_path=self.config_path, urdf_root=self.urdf_root)
+            metadata = self._sidecar.initialize(
+                config_path=self.config_path, urdf_root=self.urdf_root, grasp_terms=grasp_terms)
             if metadata.get("package") != "dex-retargeting" or metadata.get("version") != OFFICIAL_DEX_VERSION:
                 raise DexRetargetingUnavailable("dex sidecar did not report official dex-retargeting 0.4.6")
             if metadata.get("wheel_sha256") != OFFICIAL_WHEEL_SHA256:
@@ -132,6 +163,10 @@ class ShadowDexRetargeter:
                 raise DexRetargetingUnavailable(f"Shadow DexPilot must expose 2x15 human indices, got {indices.shape}")
             if len(names) != len(SHADOW_DEX_JOINT_NAMES) or set(names) != SHADOW_DEX_JOINT_NAMES:
                 raise DexRetargetingUnavailable(f"Shadow dex joint names do not match the Shadow URDF: {names}")
+            applied = metadata.get("grasp_terms")
+            if (grasp_terms is None) != (applied is None) or (
+                    thumb_lift_gain is not None and applied.get("thumb_lift_gain") != float(thumb_lift_gain)):
+                raise DexRetargetingUnavailable("dex sidecar did not apply the requested Shadow grasp terms")
         except Exception as exc:
             self.close()
             if isinstance(exc, DexRetargetingUnavailable):
@@ -142,6 +177,7 @@ class ShadowDexRetargeter:
         self.human_indices = indices
         self.joint_names = names
         self.python_path = python_path
+        self.grasp_terms = metadata.get("grasp_terms")
 
     def retarget(self, mano_landmarks_m: Sequence[Sequence[float]]) -> np.ndarray:
         joints = np.asarray(mano_landmarks_m, dtype=np.float64)
@@ -159,6 +195,7 @@ class ShadowDexRetargeter:
         raw = np.asarray(result.get("raw_qpos"), dtype=np.float64).reshape(-1)
         if raw.shape != (len(self.joint_names),) or not np.all(np.isfinite(raw)):
             raise DexFrameRejected("official dex returned non-finite or incorrectly sized Shadow output")
+        self.last_mapping = result.get("mapping")
         return raw
 
     def reset(self) -> None:
@@ -179,9 +216,14 @@ class ShadowDexRetargeter:
             "package": "dex-retargeting",
             "version": OFFICIAL_DEX_VERSION,
             "runtime": "sidecar",
-            "algorithm": "official DexPilot (thumb-finger pair + wrist-tip vectors)",
+            "algorithm": "official DexPilot (thumb-finger pair + wrist-tip vectors)" + (
+                " + project mapping (thumb / finger posture, thumb lift gain, per-finger length scale,"
+                f" continuous pinch between {self.grasp_terms.get('pinch_points', 'tips')})"
+                if self.grasp_terms else ""),
             "config_path": str(self.config_path),
             "config_sha256": _sha256(self.config_path),
+            "grasp_terms_path": None if self.grasp_terms_path is None else str(self.grasp_terms_path),
+            "grasp_terms": self.grasp_terms,
             "urdf_root": str(self.urdf_root),
             "wheel_path": str(OFFICIAL_WHEEL),
             "worker_path": str(DEX_SIDECAR_WORKER),
@@ -283,6 +325,10 @@ class ShadowDexHandInput:
                 "unmirror_world_x": self.unmirror_world_x,
                 "raw_dex_qpos": raw,
                 "retargeting_joint_names": list(self.retargeter.joint_names),
+                # Operator hand as sent to the solver (MANO frame, m), so the
+                # camera-to-robot gains can be re-derived from a session log.
+                "mano_landmarks": np.round(mano, 5),
+                "dex_mapping": getattr(self.retargeter, "last_mapping", None),
             }
             return self._command_locked(valid=True)
 

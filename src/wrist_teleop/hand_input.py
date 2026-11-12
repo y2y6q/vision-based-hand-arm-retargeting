@@ -8,6 +8,7 @@ all SpaceMouse input.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 import math
 import os
@@ -16,6 +17,8 @@ import time
 from typing import Any, Callable, Sequence
 
 import numpy as np
+
+from .loop_timing import LatestSlot, StageProfiler
 
 
 DEFAULT_ALLEGRO_JOINT_NAMES = tuple(f"joint_{index}.0" for index in range(16))
@@ -41,6 +44,10 @@ class HandCommand:
     curls: np.ndarray
     error: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
+    # Camera-frame time (monotonic) of the frame that produced
+    # ``joint_targets``; ``timestamp_s`` is the time of the query. The main
+    # loop uses it to tell a new camera sample from a repeated one.
+    sample_timestamp_s: float | None = None
 
 
 def _point(landmark: Any) -> np.ndarray:
@@ -193,6 +200,7 @@ class HandInputAdapter:
             tracking_state=self._tracking_state, calibration_state=self.calibration_state,
             curls=self._curls.copy(), error=self._error,
             details={"algorithm": "legacy-curl"},
+            sample_timestamp_s=self._timestamp if self._timestamp > 0.0 else None,
         )
 
 
@@ -203,6 +211,12 @@ class DexHandInputAdapter:
     it produces a bounded 16-joint target, carries no wrist command, and becomes
     invalid after a finite timeout.  It deliberately does not use the legacy
     curl path if dex rejects a frame or is unavailable.
+
+    ``unmirror_world_x`` undoes the horizontal flip the camera worker applies
+    before MediaPipe (as ``ShadowDexHandInput`` already does). A flipped image
+    yields mirror-image 3-D landmarks, i.e. a left-hand shape under a "Right"
+    label; the right-hand solver then bends the fingers the wrong way and gets
+    stuck. ``input_is_mirrored`` only concerns the handedness label.
     """
 
     def __init__(
@@ -215,8 +229,9 @@ class DexHandInputAdapter:
         stale_timeout_s: float = 0.5,
         expected_handedness: str = "Right",
         input_is_mirrored: bool = False,
-        relative_motion: bool = True,
+        relative_motion: bool = False,
         relative_motion_gain: float = 1.0,
+        unmirror_world_x: bool = False,
     ):
         self.retargeter = retargeter
         self.lower_limits = np.asarray(lower_limits, dtype=np.float64).reshape(16)
@@ -242,6 +257,7 @@ class DexHandInputAdapter:
         self.input_is_mirrored = bool(input_is_mirrored)
         self.relative_motion = bool(relative_motion)
         self.relative_motion_gain = float(relative_motion_gain)
+        self.unmirror_world_x = bool(unmirror_world_x)
         self._targets = np.clip(np.zeros(16), self.lower_limits, self.upper_limits)
         self._safe_open_targets = self._targets.copy()
         self._raw_targets: np.ndarray | None = None
@@ -304,6 +320,14 @@ class DexHandInputAdapter:
         try:
             from .dex_retargeting import mediapipe_world_to_mano
 
+            if self.unmirror_world_x:
+                points = np.asarray(
+                    [(point.x, point.y, point.z) if hasattr(point, "x") else point for point in landmarks],
+                    dtype=np.float64,
+                )
+                if points.shape != (21, 3):
+                    raise ValueError("dex requires 21 world landmarks")
+                landmarks = points * np.array((-1.0, 1.0, 1.0))
             mano = mediapipe_world_to_mano(
                 landmarks,
                 handedness=handedness,
@@ -338,6 +362,7 @@ class DexHandInputAdapter:
                 "expected_handedness": self.expected_handedness,
                 "observed_handedness": str(handedness),
                 "input_is_mirrored": self.input_is_mirrored,
+                "unmirror_world_x": self.unmirror_world_x,
                 "mano_landmarks_m": mano,
                 "human_indices": np.asarray(result.human_indices, dtype=np.intp),
                 "ref_value_m": np.asarray(result.ref_value, dtype=np.float64),
@@ -424,6 +449,7 @@ class DexHandInputAdapter:
             curls=np.zeros(4, dtype=np.float64),
             error=self._error,
             details=dict(self._details),
+            sample_timestamp_s=self._timestamp if self._timestamp > 0.0 else None,
         )
 
 
@@ -483,6 +509,61 @@ class CameraHandWorker:
         self._read_failures = 0
         self._last_frame_timestamp: float | None = None
         self._detected_handedness: tuple[str, ...] = ()
+        # Per-stage timing of this thread (perf_counter); see timing_snapshot.
+        self.timing = StageProfiler()
+        self._latest_result_perf_s: float | None = None
+        # A grabber thread drains the one capture continuously and keeps only
+        # the newest frame here, so a slow MediaPipe / dex frame never leaves
+        # older frames queued in the driver buffer.
+        self._frame_slot: LatestSlot | None = None
+        self._grab_error: str | None = None
+        # Every fresh hand sample (a frame the adapter accepted), keyed by a
+        # sequence number, with the perf_counter time its frame was read. The
+        # simulator loop pulls them with ``samples_since`` for fixed-delay
+        # resampling; ~4 s of frames is far more than one delay needs.
+        self._samples: deque[tuple[int, float, np.ndarray]] = deque(maxlen=128)
+        self._sample_seq = 0
+
+    def timing_snapshot(self) -> dict[str, Any]:
+        """Rate / latency / jitter of each camera stage.
+
+        ``camera_read`` runs on the grabber (its rate is the camera frame
+        rate); ``frame_wait``, ``frame_age_at_process``, ``mediapipe``,
+        ``hand_update`` (incl. the dex sidecar), ``result_latency`` (frame
+        read to result ready) and ``camera_frame_total`` (processing of one
+        frame) run on the processing thread.
+        """
+
+        return self.timing.snapshot()
+
+    def samples_since(self, seq: int) -> tuple[int, list[tuple[float, np.ndarray]]]:
+        """Fresh hand samples newer than ``seq``: (frame read time on perf_counter, targets).
+
+        Returns the newest sequence number too, to pass back on the next call.
+        Frames the adapter rejected or held are not samples.
+        """
+
+        with self._status_lock:
+            newest = self._sample_seq
+            items = [(frame_s, targets) for number, frame_s, targets in self._samples if number > seq]
+        return newest, items
+
+    def _record_sample(self, frame_read_s: float, command: HandCommand) -> bool:
+        """Keep one processed frame's result if the adapter accepted that frame."""
+
+        # A held or rejected frame repeats an older target: not a new sample.
+        if not (command.valid and command.tracking_state == "tracking"):
+            return False
+        with self._status_lock:
+            self._sample_seq += 1
+            self._samples.append((self._sample_seq, float(frame_read_s), command.joint_targets))
+        return True
+
+    @property
+    def latest_result_perf_s(self) -> float | None:
+        """perf_counter time at which the adapter last received a frame's result."""
+
+        return self._latest_result_perf_s
 
     def start(self) -> None:
         if self._thread is not None:
@@ -529,11 +610,14 @@ class CameraHandWorker:
 
         with self._capture_lock:
             capture_open = self._capture is not None
+        slot = self._frame_slot
         with self._status_lock:
             return {
                 "running": self.running,
                 "frames_read": self._frames_read,
                 "frames_processed": self._frames_processed,
+                # Frames replaced by a newer one before MediaPipe got to them.
+                "frames_dropped_latest_only": 0 if slot is None else slot.dropped,
                 "read_failures": self._read_failures,
                 "last_frame_timestamp_s": self._last_frame_timestamp,
                 "detected_handedness": list(self._detected_handedness),
@@ -763,9 +847,35 @@ class CameraHandWorker:
         landmarks = getattr(selected, "landmark", None)
         return landmarks if landmarks is not None else None
 
+    def _grab_frames(self, capture: Any, slot: LatestSlot, stop: threading.Event) -> None:  # pragma: no cover - camera
+        """Only reader of the capture: publish each frame, newest wins."""
+
+        perf = time.perf_counter
+        try:
+            while not stop.is_set() and not self._stop.is_set():
+                read_start = perf()
+                ok, frame = capture.read()
+                timestamp = time.monotonic()
+                read_end = perf()
+                self.timing.add("camera_read", read_end - read_start, read_end)
+                if ok:
+                    with self._status_lock:
+                        self._frames_read += 1
+                        self._last_frame_timestamp = timestamp
+                slot.put((bool(ok), frame if ok else None, timestamp, read_end))
+                if not ok:
+                    time.sleep(0.02)
+        except Exception as exc:
+            if not stop.is_set() and not self._stop.is_set():
+                self._grab_error = f"camera read failed: {type(exc).__name__}: {exc}"
+        finally:
+            slot.close()
+
     def _run(self) -> None:  # pragma: no cover - requires a physical camera / GUI
         capture = None
         hands = None
+        grabber: threading.Thread | None = None
+        grab_stop = threading.Event()
         try:
             import cv2
             import mediapipe as mp
@@ -779,18 +889,34 @@ class CameraHandWorker:
                 self._capture = capture
             hands = mp.solutions.hands.Hands(static_image_mode=False, max_num_hands=2, model_complexity=1,
                                               min_detection_confidence=0.60, min_tracking_confidence=0.60)
+            perf = time.perf_counter
+            slot = LatestSlot()
+            self._frame_slot = slot
+            grabber = threading.Thread(
+                target=self._grab_frames, args=(capture, slot, grab_stop), name="camera-frame-grabber", daemon=True
+            )
+            grabber.start()
             while not self._stop.is_set():
-                ok, frame = capture.read()
-                timestamp = time.monotonic()
+                wait_start = perf()
+                item = slot.take(timeout=0.5)
+                frame_start = perf()
+                if item is None:
+                    if slot.closed:
+                        if self._grab_error is not None:
+                            raise RuntimeError(self._grab_error)
+                        break
+                    # No new frame yet; the adapter's stale timeout decides
+                    # hold versus safe-open, exactly as a blocked read did.
+                    continue
+                ok, frame, timestamp, read_end = item
+                self.timing.add("frame_wait", frame_start - wait_start, frame_start)
+                # How old the newest frame already is when processing starts.
+                self.timing.add("frame_age_at_process", frame_start - read_end, frame_start)
                 if not ok:
                     with self._status_lock:
                         self._read_failures += 1
                     self.adapter.mark_lost(timestamp, "camera read failed")
-                    time.sleep(0.02)
                     continue
-                with self._status_lock:
-                    self._frames_read += 1
-                    self._last_frame_timestamp = timestamp
                 # MediaPipe's handedness classifier assumes a selfie-style
                 # mirrored image. Canonicalise raw Windows webcam frames by
                 # default. ``mirror_input=False`` is reserved for a driver
@@ -799,7 +925,10 @@ class CameraHandWorker:
                     frame = cv2.flip(frame, 1)
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 rgb.flags.writeable = False
+                detect_start = perf()
                 result = hands.process(rgb)
+                detect_end = perf()
+                self.timing.add("mediapipe", detect_end - detect_start, detect_end)
                 rgb.flags.writeable = True
                 landmark_sets = list(getattr(result, "multi_hand_landmarks", None) or ())
                 handedness_sets = list(getattr(result, "multi_handedness", None) or ())
@@ -868,6 +997,13 @@ class CameraHandWorker:
                 else:
                     landmarks = None
                     command = self.adapter.mark_lost(timestamp)
+                update_end = perf()
+                # Landmark selection plus the adapter (dex: sidecar round trip).
+                self.timing.add("hand_update", update_end - detect_end, update_end)
+                # Frame read to result ready: what a fixed resampling delay must cover.
+                self.timing.add("result_latency", update_end - read_end, update_end)
+                self._latest_result_perf_s = update_end
+                self._record_sample(read_end, command)
                 if self.display:
                     for landmarks_to_draw in landmark_sets:
                         mp.solutions.drawing_utils.draw_landmarks(
@@ -879,15 +1015,21 @@ class CameraHandWorker:
                     with self._display_lock:
                         self._latest_display_frame = np.ascontiguousarray(frame.copy())
                         self._latest_display_timestamp = timestamp
+                frame_end = perf()
+                self.timing.add("camera_frame_total", frame_end - frame_start, frame_end)
         except Exception as exc:
             if not self._stop.is_set():
                 self.error = f"camera worker failed: {type(exc).__name__}: {exc}"
                 self.adapter.mark_lost(error=self.error)
         finally:
+            grab_stop.set()
+            if capture is not None:
+                # Unblocks a grabber waiting inside ``read``.
+                capture.release()
+            if grabber is not None:
+                grabber.join(timeout=1.0)
             if hands is not None:
                 hands.close()
-            if capture is not None:
-                capture.release()
             with self._capture_lock:
                 if self._capture is capture:
                     self._capture = None

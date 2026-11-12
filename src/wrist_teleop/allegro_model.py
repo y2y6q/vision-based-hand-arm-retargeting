@@ -719,6 +719,11 @@ def make_allegro_panda_env(
         impedance_mode="fixed",
         output_min=[-config.max_translation_delta_m] * 3 + [-config.max_rotation_delta_rad] * 3,
         output_max=[config.max_translation_delta_m] * 3 + [config.max_rotation_delta_rad] * 3,
+        # Full 6-D task-space inertia instead of separate position / rotation
+        # blocks. With the split blocks, a pure SpaceMouse rotation pushed the
+        # hand 25-41 mm sideways and left it creeping after release (replay of
+        # the 2026-11-05 session); coupled, the same inputs move it < 2 mm.
+        uncouple_pos_ori=False,
     )
     # Preserve the live teleoperation factory's historical default when the
     # caller omits this argument.  Scripted validation can explicitly pass

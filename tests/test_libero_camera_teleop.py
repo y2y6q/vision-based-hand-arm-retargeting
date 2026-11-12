@@ -35,12 +35,13 @@ class LiberoCameraArmTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         from wrist_teleop.config import WristConfig
         from wrist_teleop import libero_spatial_teleop as L
+        from wrist_teleop.libero_camera_teleop import CAMERA_OSC_KP
 
         cls.L = L
         cls.config = WristConfig.load(ROOT / "configs" / "spacemouse_wrist.json")
         cls.session = L.OfficialLiberoSpatialSession(
             L.PANDA_SHADOW_SPEC, cls.config, task_id=0, task_order=0, init_state_id=0, seed=7,
-            has_offscreen_renderer=True,
+            has_offscreen_renderer=True, osc_kp=CAMERA_OSC_KP,
         )
         cls.session.open()
 
@@ -110,11 +111,14 @@ class LiberoCameraArmTests(unittest.TestCase):
         right = moved()
         self.assertGreater(right[0], 0.04)
         np.testing.assert_allclose(right[1:], 0.0, atol=0.012)
-        hold((0.08, 0.07, 0), 0.0, 2.0, ramp_s=0.3)  # held nearer the camera -> away
+        hold((0.08, 0.07, 0), 0.0, 1.5, ramp_s=0.4)  # nearer the camera -> away
         away = moved()
-        self.assertGreater(away[1], right[1] + 0.03)
-        hold((0.08, 0.0, 0), 0.0, 1.0, ramp_s=0.3)  # neutral again: stops
+        self.assertGreater(away[1], right[1] + 0.04)
+        hold((0.08, 0.07, 0), 0.0, 1.5)  # held there: the arm stays (no rate control)
+        self.assertLess(float(np.linalg.norm(moved() - away)), 0.006)
+        hold((0.08, 0.0, 0), 0.0, 1.5, ramp_s=0.4)  # back -> comes back
         stopped = moved()
+        self.assertLess(stopped[1], away[1] - 0.04)
         hold((0.08, 0.0, 0), 0.0, 1.0)
         self.assertLess(float(np.linalg.norm(moved() - stopped)), 0.006)
         hold((0.08, 0.0, 0.06), 0.0, 2.0)  # up -> up

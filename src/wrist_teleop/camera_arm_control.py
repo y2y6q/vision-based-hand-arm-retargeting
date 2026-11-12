@@ -16,21 +16,21 @@ Pipeline (camera thread -> control loop):
    deadbands that only open when that axis is really moving, and turns
    hand motion into an incremental robot target, like a mouse:
 
-   * left / right and up / down: each frame's hand displacement moves the
-     target by ``displacement * g(hand speed)``; ``g`` rises from a small
-     gain for slow, careful motion to a large one for quick sweeps
-     ("pointer acceleration"), so fine positioning and long moves both work.
-   * toward / away from the camera (the noisiest axis) is rate controlled:
-     hold the hand nearer than the neutral depth to move the robot away,
-     farther to bring it back, inside a deadzone it does not move. The
-     neutral depth is captured whenever tracking (re)starts.
+   * every direction (left / right, up / down, toward / away from the
+     camera): each frame's hand displacement moves the target by
+     ``displacement * g(hand speed)``; ``g`` rises from a small gain for
+     slow, careful motion to a large one for quick sweeps ("pointer
+     acceleration"), so fine positioning and long moves both work. A still
+     hand never moves the robot, in depth too.
    * orientation follows the whole palm rotation (knob turn and tilts); it
      accumulates only while the hand is not translating, so the wobble of a
      moving hand never turns the robot.
 
    Nothing is absolute, so the arm never jumps to a hand position. Showing
    the LEFT hand next to the right one is a clutch (like lifting a mouse):
-   the arm holds while the right hand is repositioned.
+   the arm holds while the right hand is repositioned. After a pause or a
+   lost hand, tracking restarts only once the hand is held still, so the
+   arm does not follow the hand coming back into place.
 3. The control loop rate-limits the target (``TargetFollower``) and clamps
    it to a safe workspace / orientation cone (``WorkspaceLimits``);
    ``ArmSafetyGuard`` refuses steps that drive a joint into its limit or the
@@ -406,7 +406,7 @@ class CameraArmSettings:
     """Every tuning constant of the camera -> arm mapping, in one place."""
 
     focal_width_normalized: float = 0.78  # ~65 deg horizontal webcam FOV
-    # Left / right and up / down (incremental, pointer acceleration): robot
+    # Translation (incremental, pointer acceleration, all three axes): robot
     # metres per hand metre rise from ``slow_gain`` at ``slow_speed_m_s`` hand
     # speed to ``fast_gain`` at ``fast_speed_m_s``, times ``translation_gain``
     # (the - / = keys).
@@ -415,11 +415,8 @@ class CameraArmSettings:
     fast_gain: float = 1.8
     slow_speed_m_s: float = 0.02
     fast_speed_m_s: float = 0.12
-    # Toward / away from the camera (rate control): robot m/s per metre of
-    # hand offset from the neutral depth beyond the deadzone, capped.
-    depth_gain: float = 1.5
-    depth_deadzone_m: float = 0.03
-    depth_max_speed_m_s: float = 0.12
+    # Extra factor on toward / away from the camera, relative to the other axes.
+    depth_gain: float = 1.0
     rotation_gain: float = 1.0  # the whole palm rotation is followed
     # Orientation is frozen while the hand translates faster than this and
     # for ``rotation_freeze_hold_s`` afterwards (a moving hand wobbles).
@@ -430,14 +427,18 @@ class CameraArmSettings:
     # +z, back of the hand +y (its palmar normal is -y).
     robot_finger_axis: tuple[float, float, float] = (0.0, 0.0, 1.0)
     robot_dorsal_axis: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    # Tuned on synthetic 2 px / 4 mm detection noise (a still hand gives
+    # zero target motion) for the shortest lag: ~70 ms left / right, ~100 ms
+    # depth. Real palm-shape depth jitters 1-2 mm at 50 cm, well inside.
     lateral_min_cutoff_hz: float = 1.0
-    lateral_beta: float = 15.0
-    depth_min_cutoff_hz: float = 0.3
-    depth_beta: float = 3.0
+    lateral_beta: float = 60.0
+    depth_min_cutoff_hz: float = 0.5
+    depth_beta: float = 5.0
     rotation_min_cutoff_hz: float = 0.3
     rotation_beta: float = 0.5
-    # Lateral deadband while the hand is still (hand metres).
+    # Deadbands while the hand is still (hand metres).
     lateral_deadband_m: float = 0.004
+    depth_deadband_m: float = 0.010
     # Rotation deadbands in the palm frame: tilts (about fingers / across)
     # depend on MediaPipe depth and are noisier than the in-image knob turn.
     tilt_deadband_rad: float = 0.10
@@ -447,10 +448,14 @@ class CameraArmSettings:
     # motion is followed smoothly. Still axes keep their full deadband.
     motion_window_s: float = 0.4
     moving_lateral_m: float = 0.008
+    moving_depth_m: float = 0.012
     moving_rotation_rad: float = 0.10
     fine_follow_s: float = 0.6
     lost_timeout_s: float = 0.3
     reacquire_frames: int = 15  # ~0.5 s of stable tracking before anchoring
+    # ... and the hand must be this still: a hand still moving into place
+    # after a pause or a lost detection is not followed.
+    anchor_still_speed_m_s: float = 0.03
     outlier_jump_m: float = 0.10
     outlier_jump_rad: float = 1.0
     # Left-hand clutch debounce (camera frames with / without the left hand).
@@ -462,16 +467,14 @@ class CameraArmSettings:
 
     def __post_init__(self) -> None:
         for name in ("focal_width_normalized", "translation_gain", "slow_gain", "fast_gain", "depth_gain",
-                     "depth_max_speed_m_s", "lateral_min_cutoff_hz", "depth_min_cutoff_hz",
-                     "rotation_min_cutoff_hz", "lost_timeout_s"):
+                     "lateral_min_cutoff_hz", "depth_min_cutoff_hz", "rotation_min_cutoff_hz", "lost_timeout_s",
+                     "anchor_still_speed_m_s"):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be positive")
         if not 0.0 <= self.slow_speed_m_s < self.fast_speed_m_s:
             raise ValueError("need 0 <= slow_speed_m_s < fast_speed_m_s")
         if not np.isfinite(self.rotation_gain) or self.rotation_gain < 0.0:
             raise ValueError("rotation_gain must be non-negative")
-        if not np.isfinite(self.depth_deadzone_m) or self.depth_deadzone_m < 0.0:
-            raise ValueError("depth_deadzone_m must be non-negative")
 
     def speed_gain(self, hand_speed_m_s: float) -> float:
         """Pointer-acceleration curve: robot metres per hand metre at this speed."""
@@ -479,12 +482,6 @@ class CameraArmSettings:
         x = (float(hand_speed_m_s) - self.slow_speed_m_s) / (self.fast_speed_m_s - self.slow_speed_m_s)
         x = min(max(x, 0.0), 1.0)
         return self.slow_gain + (self.fast_gain - self.slow_gain) * x * x * (3.0 - 2.0 * x)
-
-    def depth_rate(self, offset_m: float) -> float:
-        """Robot away-speed (m/s) for a hand held ``offset_m`` nearer the camera."""
-
-        excess = max(abs(float(offset_m)) - self.depth_deadzone_m, 0.0)
-        return math.copysign(min(excess * self.depth_gain, self.depth_max_speed_m_s), offset_m) if excess else 0.0
 
 
 @dataclass
@@ -520,10 +517,8 @@ class CameraArmMapper:
         self._target: Optional[tuple[np.ndarray, np.ndarray]] = None  # accumulated robot target
         self._published: Optional[tuple[np.ndarray, np.ndarray]] = None  # deadbanded hand pose
         self._previous: Optional[tuple[np.ndarray, np.ndarray]] = None  # published pose already used
-        self._depth_ref: Optional[float] = None  # neutral depth for rate control
-        self._last_tick: Optional[float] = None
         self._history: list[tuple[float, np.ndarray, np.ndarray]] = []
-        self._axis_active_until = np.full(2, -1e9)
+        self._axis_active_until = np.full(3, -1e9)
         self._rot_active_until = -1e9
         self._rot_frozen_until = -1e9
         self._depth_ready = False
@@ -585,7 +580,7 @@ class CameraArmMapper:
         self._filtered_pos = None
         self._filtered_rot = None
         self._history = []
-        self._axis_active_until = np.full(2, -1e9)
+        self._axis_active_until = np.full(3, -1e9)
         self._rot_active_until = -1e9
         self._depth_ready = False
 
@@ -621,7 +616,6 @@ class CameraArmMapper:
     def scale_gains(self, factor: float) -> float:
         with self._lock:
             self.settings.translation_gain = float(np.clip(self.settings.translation_gain * factor, 0.3, 3.0))
-            self.settings.depth_gain = float(np.clip(self.settings.depth_gain * factor, 0.3, 4.0))
             return self.settings.translation_gain
 
     def sync_target(self, position: np.ndarray, orientation: np.ndarray) -> None:
@@ -645,33 +639,42 @@ class CameraArmMapper:
             self._needs_anchor = True
             self._rebase = False
             self._hand_ref = self._target = self._published = self._previous = None
-            self._depth_ref = self._last_tick = None
+
+    def _motion_locked(self) -> dict[str, Any]:
+        """Filtered hand travel over the last ``motion_window_s``."""
+
+        old_t, old_pos, old_rot = self._history[0]
+        window = self._history[-1][0] - old_t
+        travel = self._filtered_pos - old_pos
+        per_s = 1.0 / window if window > 1e-3 else 0.0
+        return {
+            "travel": travel,
+            "speed": float(np.linalg.norm(travel)) * per_s,
+            "lateral_speed": float(np.linalg.norm(travel[:2])) * per_s,
+            "depth_speed": abs(float(travel[2])) * per_s,
+            "turn_rad": float(np.linalg.norm(matrix_to_rotvec(self._filtered_rot @ old_rot.T))),
+        }
 
     def _publish_locked(self, timestamp_s: float) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
         """Deadband with hysteresis: ignore small changes at rest, follow real motion."""
 
         s = self.settings
         published_pos, published_rot = self._published
-        old_t, old_pos, old_rot = self._history[0]
-        window = self._history[-1][0] - old_t
-        travel = self._filtered_pos - old_pos
-        lateral_speed = float(np.linalg.norm(travel[:2])) / window if window > 1e-3 else 0.0
-        depth_speed = abs(float(travel[2])) / window if window > 1e-3 else 0.0
-        axis_moving = np.abs(travel[:2]) > s.moving_lateral_m
-        rotating = float(np.linalg.norm(matrix_to_rotvec(self._filtered_rot @ old_rot.T))) > s.moving_rotation_rad
+        motion = self._motion_locked()
+        band = np.array((s.lateral_deadband_m, s.lateral_deadband_m, s.depth_deadband_m))
+        axis_moving = np.abs(motion["travel"]) > np.array((s.moving_lateral_m, s.moving_lateral_m, s.moving_depth_m))
+        rotating = motion["turn_rad"] > s.moving_rotation_rad
         # Per-axis latch: motion, or crossing the deadband, opens fine
         # following (20% of the band) on that axis for ``fine_follow_s``: a
         # slow move is tracked closely, and noise that crosses once only
         # wobbles briefly before the axis freezes again.
-        error = np.abs(self._filtered_pos[:2] - published_pos[:2])
-        start = axis_moving | (error > s.lateral_deadband_m)
+        error = np.abs(self._filtered_pos - published_pos)
+        start = axis_moving | (error > band)
         self._axis_active_until = np.where(start, timestamp_s + s.fine_follow_s, self._axis_active_until)
-        thresholds = np.where(timestamp_s < self._axis_active_until, 0.2 * s.lateral_deadband_m, s.lateral_deadband_m)
+        thresholds = np.where(timestamp_s < self._axis_active_until, 0.2 * band, band)
         published_pos = published_pos.copy()
         update = np.flatnonzero(error > thresholds)
         published_pos[update] = self._filtered_pos[update]
-        # Depth is rate controlled with its own deadzone around the neutral depth.
-        published_pos[2] = self._filtered_pos[2]
         rot_band = np.array((s.tilt_deadband_rad, s.tilt_deadband_rad, s.knob_deadband_rad))
         rot_error = matrix_to_rotvec(published_rot.T @ self._filtered_rot)  # palm frame
         rot_change = float(np.linalg.norm(rot_error / rot_band))
@@ -681,7 +684,8 @@ class CameraArmMapper:
             published_rot = self._filtered_rot.copy()
         self._published = (published_pos, published_rot)
         return published_pos, published_rot, {
-            "hand_speed_m_s": lateral_speed, "hand_depth_speed_m_s": depth_speed,
+            "hand_speed_m_s": motion["speed"], "hand_lateral_speed_m_s": motion["lateral_speed"],
+            "hand_depth_speed_m_s": motion["depth_speed"],
             "hand_moving_axes": axis_moving.tolist(), "hand_rotating": rotating,
         }
 
@@ -712,7 +716,11 @@ class CameraArmMapper:
                 self._needs_anchor = True
                 return ArmTargetStatus("lost" if self._target is not None else "waiting", details=details)
             if self._needs_anchor:
-                if self._good_frames < s.reacquire_frames:
+                # (Re)start only from a hand that has settled: after a pause or
+                # a lost detection the hand is usually still moving into place.
+                speed = self._motion_locked()["speed"]
+                details["hand_speed_m_s"] = speed
+                if self._good_frames < s.reacquire_frames or speed > s.anchor_still_speed_m_s:
                     return ArmTargetStatus("anchoring", details=details)
                 self._published = (self._filtered_pos.copy(), self._filtered_rot.copy())
                 self._needs_anchor = False
@@ -727,25 +735,19 @@ class CameraArmMapper:
                 self._target = (np.asarray(robot_pos, dtype=np.float64).copy(),
                                 np.asarray(robot_ori, dtype=np.float64).copy())
                 self._previous = (published_pos.copy(), published_rot.copy())
-                self._depth_ref = float(published_pos[2])
                 self._hand_ref = (self._filtered_pos.copy(), self._filtered_rot.copy())
-                self._last_tick = t
                 self._rebase = False
-            dt = min(max(t - self._last_tick, 0.0), 0.1)
-            self._last_tick = t
             previous_pos, previous_rot = self._previous
             self._previous = (published_pos.copy(), published_rot.copy())
 
-            # Left / right, up / down: this tick's hand displacement times the
-            # speed-dependent gain. Depth: velocity from the held offset.
+            # This tick's hand displacement times the speed-dependent gain, in
+            # every direction: a still hand never moves the robot.
             step = CAMERA_TO_CONTROL @ (published_pos - previous_pos)  # [right, away, up]
             gain = s.speed_gain(motion["hand_speed_m_s"]) * s.translation_gain
-            depth_offset = self._depth_ref - float(published_pos[2])  # > 0: hand nearer the camera
-            depth_rate = s.depth_rate(depth_offset)
-            step = np.array((step[0] * gain, depth_rate * dt, step[2] * gain))
+            step = step * gain * np.array((1.0, s.depth_gain, 1.0))
 
             # Orientation: the whole palm rotation, only while the hand is not translating.
-            if (motion["hand_speed_m_s"] > s.rotation_freeze_speed_m_s
+            if (motion["hand_lateral_speed_m_s"] > s.rotation_freeze_speed_m_s
                     or motion["hand_depth_speed_m_s"] > 2.0 * s.rotation_freeze_speed_m_s):
                 self._rot_frozen_until = t + s.rotation_freeze_hold_s
             frozen = t < self._rot_frozen_until
@@ -762,8 +764,8 @@ class CameraArmMapper:
             hand_offset = CAMERA_TO_CONTROL @ (self._filtered_pos - hand_ref_pos)
             hand_rotation = matrix_to_rotvec(hand_ref_rot.T @ self._filtered_rot)
             details.update({
-                "effective_gain": gain, "depth_offset_m": depth_offset, "depth_rate_m_s": depth_rate,
-                "rotation_frozen": frozen,
+                # > 0: the hand is nearer the camera than where tracking (re)started.
+                "effective_gain": gain, "depth_offset_m": float(hand_offset[1]), "rotation_frozen": frozen,
             })
         return ArmTargetStatus("tracking", target_pos.copy(), target_ori.copy(), hand_offset, hand_rotation, details)
 
